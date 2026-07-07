@@ -285,6 +285,12 @@ def skriv_till_sheets(data):
         if not cell or cell == "REPLACE_ME":
             fel.append(f"{falt}: ingen giltig cell angiven i CELL_MAP")
             continue
+            
+        # --- FIX: Konvertera numpy/scipy-typer till inbyggda Python-typer ---
+        if hasattr(varde, "item"):  # Träffar numpy.int64, numpy.float64 etc.
+            varde = varde.item()
+        # -------------------------------------------------------------------
+
         ws.update_acell(cell, varde)
         lastvarde = ws.acell(cell).value
         if str(lastvarde) != str(varde):
