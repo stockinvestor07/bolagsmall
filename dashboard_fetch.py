@@ -3,10 +3,11 @@ dashboard_fetch.py
 Automatiserad ifyllnad av bolagsdashboard i Google Sheets.
 Körs via GitHub Actions (workflow_dispatch), tar TICKER som env-variabel.
 
-Fält: ROE, Current Ratio, Soliditet, Float, % Inst. ägande, Short % of float,
-Sektor, Buy Risk, Revenue/EPS-estimat + 90d-diff, Earnings Rank, Sales Rank,
-samt kvartalshistorik (Kvartal 5-8): Revenue, EPS dil., Vinstmarginal,
-Dil. Shares, % Tillväxt (YoY), % Surprise.
+Kvartalshistorik (Kvartal 1-8) hämtas via SEC EDGAR med durationsfilter
+(79-103 dagar = garanterat diskreta kvartal, aldrig YTD-kumulativa poster).
+Q4 härleds: Årsvärde (10-K) - Q1 - Q2 - Q3, endast för summerbara mått
+(Revenue, Net Income, EPS). Diluted Shares är ett genomsnitt och kan inte
+härledas via subtraktion - Q4 blir N/A där, övriga kvartal hämtas direkt.
 IBD Company Rank, IBD Sector Rank, Trend Stage fylls INTE i (manuellt).
 """
 
@@ -58,8 +59,9 @@ CELL_MAP = {
     "pct_diff_90d_revenue": "N4",
 }
 
-# Kvartalstabellen: kolumner G-J = Kvartal 5-8 (de 4 senast rapporterade)
-KVARTAL_KOLUMNER = ["G", "H", "I", "J"]
+# Kvartalstabellen: C-J = Kvartal 1-8, äldst->nyast
+KVARTAL_KOLUMNER = ["C", "D", "E", "F", "G", "H", "I", "J"]
+ANTAL_KVARTAL = len(KVARTAL_KOLUMNER)
 RAD_REVENUE = 4
 RAD_REVENUE_TILLVAXT = 5
 RAD_EPS = 8
@@ -187,11 +189,10 @@ def hamta_yfinance_data(ticker):
 
     resultat["pct_diff_90d_revenue"] = "N/A"
 
-    # % Surprise senaste 4 kvartal (yfinance earnings dates)
     try:
-        ed = t.get_earnings_dates(limit=8)
+        ed = t.get_earnings_dates(limit=12)
         ed = ed.dropna(subset=["Surprise(%)"]).sort_index()
-        resultat["_surprise_lista"] = ed["Surprise(%)"].tail(4).round(1).tolist()
+        resultat["_surprise_lista"] = ed["Surprise(%)"].tail(ANTAL_KVARTAL).round(1).tolist()
     except Exception:
         resultat["_surprise_lista"] = []
 
@@ -199,7 +200,117 @@ def hamta_yfinance_data(ticker):
 
 
 # ============================================================
-# SEC EDGAR - fallback-fält, Earnings Rank, Sales Rank, kvartalshistorik
+# SEC EDGAR - kvartalshistorik med durationsfilter (Q1-Q3 diskreta, Q4 härledd)
+# ============================================================
+def _diskreta_kvartal(gaap, taggar, enhet):
+    """{(fy,fp): {'val','end','filed'}} - ENDAST poster med periodlängd 79-103 dagar (aldrig YTD)."""
+    for tagg in taggar:
+        if tagg not in gaap:
+            continue
+        poster = gaap[tagg]["units"].get(enhet, [])
+        serie = {}
+        for p in poster:
+            fy, fp, form = p.get("fy"), p.get("fp"), p.get("form")
+            start, end = p.get("start"), p.get("end")
+            if not (fy and fp in ("Q1", "Q2", "Q3") and form in ("10-Q", "10-Q/A") and start and end):
+                continue
+            try:
+                d = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
+            except Exception:
+                continue
+            if not (79 <= d <= 103):
+                continue
+            key = (fy, fp)
+            if key not in serie or p.get("filed", "") > serie[key].get("filed", ""):
+                serie[key] = {"val": p["val"], "end": end, "filed": p.get("filed", "")}
+        if serie:
+            return serie, tagg
+    return {}, None
+
+
+def _arsvarde(gaap, tagg, enhet):
+    """{fy: {'val','end'}} - ENDAST 10-K poster med periodlängd 350-380 dagar."""
+    poster = gaap.get(tagg, {}).get("units", {}).get(enhet, [])
+    serie = {}
+    for p in poster:
+        fy, form = p.get("fy"), p.get("form")
+        start, end = p.get("start"), p.get("end")
+        if not (fy and form in ("10-K", "10-K/A") and start and end):
+            continue
+        try:
+            d = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
+        except Exception:
+            continue
+        if not (350 <= d <= 380):
+            continue
+        if fy not in serie or p.get("filed", "") > serie[fy].get("filed", ""):
+            serie[fy] = {"val": p["val"], "end": end, "filed": p.get("filed", "")}
+    return serie
+
+
+def _bygg_kvartalsserie(gaap, taggar, enhet, harled_q4):
+    """{(fy,fp): {'val','end'}} inkl. härledd Q4 (Årsvärde - Q1 - Q2 - Q3) om harled_q4=True."""
+    q_serie, tagg = _diskreta_kvartal(gaap, taggar, enhet)
+    if not q_serie:
+        return {}
+    resultat = dict(q_serie)
+    if harled_q4 and tagg:
+        ar_serie = _arsvarde(gaap, tagg, enhet)
+        for fy, arsdata in ar_serie.items():
+            q1, q2, q3 = q_serie.get((fy, "Q1")), q_serie.get((fy, "Q2")), q_serie.get((fy, "Q3"))
+            if q1 and q2 and q3:
+                q4_val = arsdata["val"] - q1["val"] - q2["val"] - q3["val"]
+                resultat[(fy, "Q4")] = {"val": q4_val, "end": arsdata["end"]}
+    return resultat
+
+
+def hamta_kvartalshistorik(gaap):
+    """8 senaste kvartalen, äldst->nyast. Revenue/EPS/Net Income Q4-härledda, Dil.Shares endast direkta."""
+    q_ordning = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+
+    rev_serie = _bygg_kvartalsserie(gaap, SALES_TAGGAR, "USD", harled_q4=True)
+    ni_serie = _bygg_kvartalsserie(gaap, [NI_TAGG], "USD", harled_q4=True)
+    eps_serie = _bygg_kvartalsserie(gaap, [EPS_PRIMARY_TAG, EPS_FALLBACK_TAG], "USD/shares", harled_q4=True)
+    dil_serie = _bygg_kvartalsserie(gaap, [DIL_SHARES_TAGG], "shares", harled_q4=False)
+
+    if not rev_serie:
+        return []
+
+    sorterade = sorted(rev_serie.keys(), key=lambda k: (k[0], q_ordning[k[1]]))
+    senaste = sorterade[-ANTAL_KVARTAL:]
+
+    resultat = []
+    for fy, q in senaste:
+        foreg = (fy - 1, q)
+        revenue = rev_serie.get((fy, q), {}).get("val")
+        revenue_da = rev_serie.get(foreg, {}).get("val")
+        eps = eps_serie.get((fy, q), {}).get("val")
+        eps_da = eps_serie.get(foreg, {}).get("val")
+        ni = ni_serie.get((fy, q), {}).get("val")
+        dil = dil_serie.get((fy, q), {}).get("val")
+
+        rev_tv = berakna_stabil_tillvaxt(revenue, revenue_da)
+        eps_tv = berakna_stabil_tillvaxt(eps, eps_da)
+        marginal = _pct(ni / revenue) if (ni is not None and revenue) else "N/A"
+
+        resultat.append({
+            "revenue": round(revenue / 1_000_000, 1) if revenue is not None else "N/A",
+            "revenue_tillvaxt": _pct(rev_tv) if rev_tv is not None else "N/A",
+            "eps": round(eps, 2) if eps is not None else "N/A",
+            "eps_tillvaxt": _pct(eps_tv) if eps_tv is not None else "N/A",
+            "dil_shares": round(dil / 1_000_000, 1) if dil is not None else "N/A",
+            "marginal": marginal,
+        })
+
+    while len(resultat) < ANTAL_KVARTAL:
+        resultat.insert(0, {"revenue": "N/A", "revenue_tillvaxt": "N/A", "eps": "N/A",
+                             "eps_tillvaxt": "N/A", "dil_shares": "N/A", "marginal": "N/A"})
+
+    return resultat
+
+
+# ============================================================
+# SEC EDGAR - fallback ROE/Current Ratio, Earnings Rank, Sales Rank
 # ============================================================
 def _senaste_varde(gaap_facts, tagg):
     if tagg not in gaap_facts:
@@ -210,91 +321,6 @@ def _senaste_varde(gaap_facts, tagg):
         return None
     giltiga.sort(key=lambda x: x.get("end", ""))
     return giltiga[-1]["val"]
-
-
-def _serie_per_fy_fp(gaap_facts, taggar, enhet):
-    """Bygger {(fy, fp): {'val':.., 'filed':..}} från första taggen med data."""
-    for tagg in taggar:
-        if tagg not in gaap_facts:
-            continue
-        poster = gaap_facts[tagg]["units"].get(enhet, [])
-        serie = {}
-        for p in poster:
-            fy, fp, form = p.get("fy"), p.get("fp"), p.get("form")
-            if fy is None or fp is None or form not in ("10-Q", "10-Q/A", "10-K", "10-K/A"):
-                continue
-            key = (fy, fp)
-            if key not in serie or p.get("filed", "") > serie[key].get("filed", ""):
-                serie[key] = p
-        if serie:
-            return serie
-    return {}
-
-
-def _harled_kvartal(serie):
-    """(fy,'Q1'..'Q3') direkt från filing. Q4 härleds: FY - Q1 - Q2 - Q3."""
-    resultat = {}
-    fy_set = {fy for fy, fp in serie.keys()}
-    for fy in fy_set:
-        q1, q2, q3 = serie.get((fy, "Q1")), serie.get((fy, "Q2")), serie.get((fy, "Q3"))
-        fy_full = serie.get((fy, "FY"))
-        if q1:
-            resultat[(fy, "Q1")] = q1["val"]
-        if q2:
-            resultat[(fy, "Q2")] = q2["val"]
-        if q3:
-            resultat[(fy, "Q3")] = q3["val"]
-        if fy_full and q1 and q2 and q3:
-            resultat[(fy, "Q4")] = fy_full["val"] - q1["val"] - q2["val"] - q3["val"]
-    return resultat
-
-
-def hamta_kvartalshistorik(gaap):
-    """Returnerar lista med de 4 senaste kvartalen (äldst->nyast), en dict per kvartal."""
-    q_ordning = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
-
-    rev_serie = _serie_per_fy_fp(gaap, SALES_TAGGAR, "USD")
-    rev_q = _harled_kvartal(rev_serie)
-
-    ni_serie = _serie_per_fy_fp(gaap, [NI_TAGG], "USD")
-    ni_q = _harled_kvartal(ni_serie)
-
-    eps_serie = _serie_per_fy_fp(gaap, [EPS_PRIMARY_TAG, EPS_FALLBACK_TAG], "USD/shares")
-    eps_q = _harled_kvartal(eps_serie)
-
-    dil_serie = _serie_per_fy_fp(gaap, [DIL_SHARES_TAGG], "shares")
-    dil_q = _harled_kvartal(dil_serie)
-
-    if not rev_q:
-        return []
-
-    sorterade_nycklar = sorted(rev_q.keys(), key=lambda k: (k[0], q_ordning[k[1]]))
-    senaste_4 = sorterade_nycklar[-4:]
-
-    resultat = []
-    for fy, q in senaste_4:
-        foreg_key = (fy - 1, q)
-        revenue = rev_q.get((fy, q))
-        revenue_da = rev_q.get(foreg_key)
-        eps = eps_q.get((fy, q))
-        eps_da = eps_q.get(foreg_key)
-        ni = ni_q.get((fy, q))
-        dil_shares = dil_q.get((fy, q))
-
-        rev_tillvaxt = berakna_stabil_tillvaxt(revenue, revenue_da)
-        eps_tillvaxt = berakna_stabil_tillvaxt(eps, eps_da)
-        marginal = _pct(ni / revenue) if (ni is not None and revenue) else "N/A"
-
-        resultat.append({
-            "revenue": round(revenue / 1_000_000, 1) if revenue is not None else "N/A",
-            "revenue_tillvaxt": _pct(rev_tillvaxt) if rev_tillvaxt is not None else "N/A",
-            "eps": round(eps, 2) if eps is not None else "N/A",
-            "eps_tillvaxt": _pct(eps_tillvaxt) if eps_tillvaxt is not None else "N/A",
-            "dil_shares": round(dil_shares / 1_000_000, 1) if dil_shares is not None else "N/A",
-            "marginal": marginal,
-        })
-
-    return resultat
 
 
 def sec_edgar_data_och_ranks(ticker, cik_str, falt_saknas):
@@ -405,7 +431,6 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
 
     fel = []
 
-    # Skalära fält
     for falt, varde in data.items():
         cell = CELL_MAP.get(falt)
         if not cell:
@@ -416,13 +441,11 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
         if str(lastvarde) != str(varde):
             fel.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}'")
 
-    # Kvartalstabell (batch-skrivning per rad, G:J)
+    kol_start, kol_slut = KVARTAL_KOLUMNER[0], KVARTAL_KOLUMNER[-1]
+
     def skriv_rad(rad_nr, faltnamn):
         varden = [_konvertera(kv.get(faltnamn, "N/A")) for kv in kvartalshistorik]
-        if len(varden) < 4:
-            varden = ["N/A"] * (4 - len(varden)) + varden
-        rng = f"G{rad_nr}:J{rad_nr}"
-        ws.update(rng, [varden])
+        ws.update(f"{kol_start}{rad_nr}:{kol_slut}{rad_nr}", [varden])
 
     if kvartalshistorik:
         skriv_rad(RAD_REVENUE, "revenue")
@@ -434,10 +457,9 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
     else:
         fel.append("kvartalshistorik: ingen data hämtad från SEC EDGAR")
 
-    # % Surprise (senaste 4, från yfinance)
-    surprise_pad = surprise_lista[-4:]
-    surprise_pad = ["N/A"] * (4 - len(surprise_pad)) + surprise_pad
-    ws.update(f"G{RAD_SURPRISE}:J{RAD_SURPRISE}", [surprise_pad])
+    surprise_pad = surprise_lista[-ANTAL_KVARTAL:]
+    surprise_pad = ["N/A"] * (ANTAL_KVARTAL - len(surprise_pad)) + surprise_pad
+    ws.update(f"{kol_start}{RAD_SURPRISE}:{kol_slut}{RAD_SURPRISE}", [surprise_pad])
 
     return fel
 
