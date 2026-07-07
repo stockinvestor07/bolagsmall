@@ -52,6 +52,7 @@ CELL_MAP = {
     "pct_diff_90d_revenue": "N4",
     "earnings_rank": "P12",  # Ny cell
     "sales_rank": "P13",     # Ny cell
+    "short_percentage_of_float": "P10",
 }
 
 SHEET_ID = os.environ["SHEET_ID"]
@@ -124,6 +125,7 @@ def hamta_yfinance_data(ticker):
     resultat["float"] = float(info.get("floatShares", 0)) / 1_000_000
     resultat["inst_agande"] = _pct(info.get("heldPercentInstitutions"))
     resultat["sektor"] = info.get("sector", "N/A")
+    resultat["short_percentage_of_float"] = _pct(info.get("shortPercentOfFloat"))
 
     try:
         hist = t.history(period="3mo")
