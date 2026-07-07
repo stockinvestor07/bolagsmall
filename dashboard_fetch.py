@@ -133,12 +133,20 @@ def hamta_yfinance_data(ticker):
     except Exception:
         resultat["buy_risk"] = "N/A"
 
-# --- REVENUE ESTIMATES (KVARTAL) ---
+# --- REVENUE ESTIMATES (KVARTAL I MUSD) ---
     try:
         rev_est = t.get_revenue_estimate()
-        # Ändrat från "0y"/"+1y" till "0q" (nuvarande kvartal) och "+1q" (nästkommande)
-        resultat["revenue_est_1"] = rev_est.loc["0q", "avg"] if "0q" in rev_est.index else "N/A"
-        resultat["revenue_est_2"] = rev_est.loc["+1q", "avg"] if "+1q" in rev_est.index else "N/A"
+        
+        if "0q" in rev_est.index and rev_est.loc["0q", "avg"] is not None:
+            resultat["revenue_est_1"] = round(rev_est.loc["0q", "avg"] / 1000000, 1)
+        else:
+            resultat["revenue_est_1"] = "N/A"
+            
+        if "+1q" in rev_est.index and rev_est.loc["+1q", "avg"] is not None:
+            resultat["revenue_est_2"] = round(rev_est.loc["+1q", "avg"] / 1000000, 1)
+        else:
+            resultat["revenue_est_2"] = "N/A"
+            
     except Exception:
         resultat["revenue_est_1"] = "N/A"
         resultat["revenue_est_2"] = "N/A"
