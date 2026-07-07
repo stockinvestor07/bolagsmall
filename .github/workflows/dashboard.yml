@@ -1,0 +1,30 @@
+name: Dashboard Fetch
+
+on:
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Ticker att hämta data för"
+        required: true
+        type: string
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install yfinance gspread google-auth requests
+
+      - name: Run dashboard fetch
+        env:
+          TICKER: ${{ inputs.ticker }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+        run: python dashboard_fetch.py
