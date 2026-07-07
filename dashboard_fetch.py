@@ -139,9 +139,8 @@ def hamta_yfinance_data(ticker):
     # --- SOLIDITET (SENASTE KVARTALET) ---
     try:
         q_bs = t.quarterly_balance_sheet
-        # Den senaste rapporten är den första kolumnen (index 0)
-        ek = q_bs.loc["stockholdersEquity"].iloc[0]
-        tillgangar = q_bs.loc["totalAssets"].iloc[0]
+        ek = q_bs.loc["Stockholders Equity"].iloc[0]
+        tillgangar = q_bs.loc["Total Assets"].iloc[0]
         
         if pd.notna(ek) and pd.notna(tillgangar) and tillgangar != 0:
             resultat["soliditet"] = _pct(ek / tillgangar)
