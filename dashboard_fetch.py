@@ -23,18 +23,18 @@ HEADERS = {"User-Agent": "Anton Werner anton.js.werner@gmail.com"}
 # på bladet "Dashboard" innan första körning.
 # ============================================================
 CELL_MAP = {
-    "roe": "REPLACE_ME",
-    "current_ratio": "REPLACE_ME",
-    "float": "REPLACE_ME",
-    "inst_agande": "REPLACE_ME",
-    "sektor": "REPLACE_ME",
-    "buy_risk": "REPLACE_ME",
-    "revenue_est_1": "REPLACE_ME",
-    "revenue_est_2": "REPLACE_ME",
-    "eps_est_1": "REPLACE_ME",
-    "eps_est_2": "REPLACE_ME",
-    "pct_diff_90d_eps": "REPLACE_ME",
-    "pct_diff_90d_revenue": "REPLACE_ME",
+    "roe": "P4",
+    "current_ratio": "P5",
+    "float": "P7",
+    "inst_agande": "P9",
+    "sektor": "P21",
+    "buy_risk": "P19",
+    "revenue_est_1": "L4",
+    "revenue_est_2": "M4",
+    "eps_est_1": "L8",
+    "eps_est_2": "M8",
+    "pct_diff_90d_eps": "L12",
+    "pct_diff_90d_revenue": "N4",
 }
 
 SHEET_ID = os.environ["SHEET_ID"]
