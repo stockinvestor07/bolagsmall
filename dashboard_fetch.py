@@ -14,6 +14,7 @@ import json
 import requests
 import yfinance as yf
 import gspread
+import pandas as pd
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 from scipy.stats import percentileofscore
