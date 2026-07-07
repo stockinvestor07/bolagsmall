@@ -133,26 +133,32 @@ def hamta_yfinance_data(ticker):
     except Exception:
         resultat["buy_risk"] = "N/A"
 
+# --- REVENUE ESTIMATES (KVARTAL) ---
     try:
         rev_est = t.get_revenue_estimate()
-        resultat["revenue_est_1"] = rev_est.loc["0y", "avg"] if "0y" in rev_est.index else "N/A"
-        resultat["revenue_est_2"] = rev_est.loc["+1y", "avg"] if "+1y" in rev_est.index else "N/A"
+        # Ändrat från "0y"/"+1y" till "0q" (nuvarande kvartal) och "+1q" (nästkommande)
+        resultat["revenue_est_1"] = rev_est.loc["0q", "avg"] if "0q" in rev_est.index else "N/A"
+        resultat["revenue_est_2"] = rev_est.loc["+1q", "avg"] if "+1q" in rev_est.index else "N/A"
     except Exception:
         resultat["revenue_est_1"] = "N/A"
         resultat["revenue_est_2"] = "N/A"
 
+    # --- EPS ESTIMATES (KVARTAL) ---
     try:
         eps_est = t.get_earnings_estimate()
-        resultat["eps_est_1"] = eps_est.loc["0y", "avg"] if "0y" in eps_est.index else "N/A"
-        resultat["eps_est_2"] = eps_est.loc["+1y", "avg"] if "+1y" in eps_est.index else "N/A"
+        # Ändrat från "0y"/"+1y" till "0q" (nuvarande kvartal) och "+1q" (nästkommande)
+        resultat["eps_est_1"] = eps_est.loc["0q", "avg"] if "0q" in eps_est.index else "N/A"
+        resultat["eps_est_2"] = eps_est.loc["+1q", "avg"] if "+1q" in eps_est.index else "N/A"
     except Exception:
         resultat["eps_est_1"] = "N/A"
         resultat["eps_est_2"] = "N/A"
 
+    # --- EPS TREND % DIFF 90D (KVARTAL) ---
     try:
         eps_trend = t.get_eps_trend()
-        nu = eps_trend.loc["0y", "current"]
-        for_90d = eps_trend.loc["0y", "90daysAgo"]
+        # Ändrat från "0y" till "0q" för att matcha % Diff (90d) mot nuvarande kvartal
+        nu = eps_trend.loc["0q", "current"]
+        for_90d = eps_trend.loc["0q", "90daysAgo"]
         resultat["pct_diff_90d_eps"] = _pct((nu - for_90d) / abs(for_90d)) if for_90d else "N/A"
     except Exception:
         resultat["pct_diff_90d_eps"] = "N/A"
