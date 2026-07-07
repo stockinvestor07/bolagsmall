@@ -121,7 +121,7 @@ def hamta_yfinance_data(ticker):
 
     resultat["roe"] = _pct(info.get("returnOnEquity"))
     resultat["current_ratio"] = info.get("currentRatio", "N/A")
-    resultat["float"] = info.get("floatShares", "N/A")
+    resultat["float"] = float(info.get("floatShares", 0)) / 1_000_000
     resultat["inst_agande"] = _pct(info.get("heldPercentInstitutions"))
     resultat["sektor"] = info.get("sector", "N/A")
 
