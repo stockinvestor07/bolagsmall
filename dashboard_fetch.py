@@ -192,8 +192,9 @@ def hamta_yfinance_data(ticker):
     try:
         ed = t.get_earnings_dates(limit=12)
         ed = ed.dropna(subset=["Surprise(%)"]).sort_index()
-        resultat["_surprise_lista"] = ed["Surprise(%)"].tail(ANTAL_KVARTAL).round(1).tolist()
-    except Exception:
+        resultat["_surprise_lista"] = ed["Surprise(%)"].tail(4).round(1).tolist()
+    except Exception as e:
+        print(f"Surprise-hämtning misslyckades: {e}")
         resultat["_surprise_lista"] = []
 
     return resultat
@@ -474,9 +475,10 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
     else:
         fel.append("kvartalshistorik: ingen data hämtad från SEC EDGAR")
 
-    surprise_pad = surprise_lista[-ANTAL_KVARTAL:]
-    surprise_pad = ["N/A"] * (ANTAL_KVARTAL - len(surprise_pad)) + surprise_pad
-    ws.update(f"{kol_start}{RAD_SURPRISE}:{kol_slut}{RAD_SURPRISE}", [surprise_pad])
+    surprise_kol_start, surprise_kol_slut = KVARTAL_KOLUMNER[-4], KVARTAL_KOLUMNER[-1]
+    surprise_pad = surprise_lista[-4:]
+    surprise_pad = ["N/A"] * (4 - len(surprise_pad)) + surprise_pad
+    ws.update(f"{surprise_kol_start}{RAD_SURPRISE}:{surprise_kol_slut}{RAD_SURPRISE}", [surprise_pad])
 
     return fel
 
