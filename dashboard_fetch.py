@@ -203,16 +203,18 @@ def hamta_yfinance_data(ticker):
 # SEC EDGAR - kvartalshistorik med durationsfilter (Q1-Q3 diskreta, Q4 härledd)
 # ============================================================
 def _diskreta_kvartal(gaap, taggar, enhet):
-    """{(fy,fp): {'val','end','filed'}} - ENDAST poster med periodlängd 79-103 dagar (aldrig YTD)."""
+    """{end_datum: {'val','filed'}} - ENDAST poster med periodlängd 79-103 dagar.
+    Nycklar på SLUTDATUM, inte fy/fp - SEC taggar jämförelseperiod (förra året)
+    med SAMMA fy/fp som aktuell period, vilket gör fy/fp opålitligt som nyckel."""
     for tagg in taggar:
         if tagg not in gaap:
             continue
         poster = gaap[tagg]["units"].get(enhet, [])
         serie = {}
         for p in poster:
-            fy, fp, form = p.get("fy"), p.get("fp"), p.get("form")
+            form = p.get("form")
             start, end = p.get("start"), p.get("end")
-            if not (fy and fp in ("Q1", "Q2", "Q3") and form in ("10-Q", "10-Q/A") and start and end):
+            if form not in ("10-Q", "10-Q/A") or not start or not end:
                 continue
             try:
                 d = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
@@ -220,22 +222,21 @@ def _diskreta_kvartal(gaap, taggar, enhet):
                 continue
             if not (79 <= d <= 103):
                 continue
-            key = (fy, fp)
-            if key not in serie or p.get("filed", "") > serie[key].get("filed", ""):
-                serie[key] = {"val": p["val"], "end": end, "filed": p.get("filed", "")}
+            if end not in serie or p.get("filed", "") > serie[end].get("filed", ""):
+                serie[end] = {"val": p["val"], "filed": p.get("filed", "")}
         if serie:
             return serie, tagg
     return {}, None
 
 
 def _arsvarde(gaap, tagg, enhet):
-    """{fy: {'val','end'}} - ENDAST 10-K poster med periodlängd 350-380 dagar."""
+    """{end_datum: {'val','filed'}} - ENDAST 10-K poster med periodlängd 350-380 dagar."""
     poster = gaap.get(tagg, {}).get("units", {}).get(enhet, [])
     serie = {}
     for p in poster:
-        fy, form = p.get("fy"), p.get("form")
+        form = p.get("form")
         start, end = p.get("start"), p.get("end")
-        if not (fy and form in ("10-K", "10-K/A") and start and end):
+        if form not in ("10-K", "10-K/A") or not start or not end:
             continue
         try:
             d = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
@@ -243,31 +244,48 @@ def _arsvarde(gaap, tagg, enhet):
             continue
         if not (350 <= d <= 380):
             continue
-        if fy not in serie or p.get("filed", "") > serie[fy].get("filed", ""):
-            serie[fy] = {"val": p["val"], "end": end, "filed": p.get("filed", "")}
+        if end not in serie or p.get("filed", "") > serie[end].get("filed", ""):
+            serie[end] = {"val": p["val"], "filed": p.get("filed", "")}
     return serie
 
 
 def _bygg_kvartalsserie(gaap, taggar, enhet, harled_q4):
-    """{(fy,fp): {'val','end'}} inkl. härledd Q4 (Årsvärde - Q1 - Q2 - Q3) om harled_q4=True."""
+    """{end_datum: {'val'}} inkl. härledd Q4 (Årsvärde - de 3 föregående kvartalsslut inom samma räkenskapsår)."""
     q_serie, tagg = _diskreta_kvartal(gaap, taggar, enhet)
     if not q_serie:
         return {}
     resultat = dict(q_serie)
     if harled_q4 and tagg:
         ar_serie = _arsvarde(gaap, tagg, enhet)
-        for fy, arsdata in ar_serie.items():
-            q1, q2, q3 = q_serie.get((fy, "Q1")), q_serie.get((fy, "Q2")), q_serie.get((fy, "Q3"))
-            if q1 and q2 and q3:
-                q4_val = arsdata["val"] - q1["val"] - q2["val"] - q3["val"]
-                resultat[(fy, "Q4")] = {"val": q4_val, "end": arsdata["end"]}
+        kvartal_datum = sorted(datetime.strptime(e, "%Y-%m-%d") for e in q_serie.keys())
+        for fy_end_str, arsdata in ar_serie.items():
+            fy_end = datetime.strptime(fy_end_str, "%Y-%m-%d")
+            # De tre kvartalsslut som ligger 0-300 dagar före räkenskapsårets slut = Q1,Q2,Q3 för det året
+            kandidater = sorted([d for d in kvartal_datum if 0 < (fy_end - d).days <= 300])[-3:]
+            if len(kandidater) == 3:
+                summa = sum(q_serie[d.strftime("%Y-%m-%d")]["val"] for d in kandidater)
+                resultat[fy_end_str] = {"val": arsdata["val"] - summa, "filed": arsdata["filed"]}
     return resultat
 
 
-def hamta_kvartalshistorik(gaap):
-    """8 senaste kvartalen, äldst->nyast. Revenue/EPS/Net Income Q4-härledda, Dil.Shares endast direkta."""
-    q_ordning = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+def _hitta_yoy_varde(serie, slutdatum_str):
+    """Letar upp värdet för samma kvartal ~365 dagar tidigare (±20 dagars tolerans)."""
+    slut_dt = datetime.strptime(slutdatum_str, "%Y-%m-%d")
+    try:
+        target = slut_dt.replace(year=slut_dt.year - 1)
+    except ValueError:
+        target = slut_dt.replace(year=slut_dt.year - 1, day=28)
+    bast_key, bast_diff = None, 21
+    for e in serie.keys():
+        e_dt = datetime.strptime(e, "%Y-%m-%d")
+        diff = abs((e_dt - target).days)
+        if diff < bast_diff:
+            bast_key, bast_diff = e, diff
+    return serie[bast_key]["val"] if bast_key else None
 
+
+def hamta_kvartalshistorik(gaap):
+    """8 senaste kvartalen, äldst->nyast, nycklade på slutdatum."""
     rev_serie = _bygg_kvartalsserie(gaap, SALES_TAGGAR, "USD", harled_q4=True)
     ni_serie = _bygg_kvartalsserie(gaap, [NI_TAGG], "USD", harled_q4=True)
     eps_serie = _bygg_kvartalsserie(gaap, [EPS_PRIMARY_TAG, EPS_FALLBACK_TAG], "USD/shares", harled_q4=True)
@@ -276,18 +294,17 @@ def hamta_kvartalshistorik(gaap):
     if not rev_serie:
         return []
 
-    sorterade = sorted(rev_serie.keys(), key=lambda k: (k[0], q_ordning[k[1]]))
+    sorterade = sorted(rev_serie.keys(), key=lambda e: datetime.strptime(e, "%Y-%m-%d"))
     senaste = sorterade[-ANTAL_KVARTAL:]
 
     resultat = []
-    for fy, q in senaste:
-        foreg = (fy - 1, q)
-        revenue = rev_serie.get((fy, q), {}).get("val")
-        revenue_da = rev_serie.get(foreg, {}).get("val")
-        eps = eps_serie.get((fy, q), {}).get("val")
-        eps_da = eps_serie.get(foreg, {}).get("val")
-        ni = ni_serie.get((fy, q), {}).get("val")
-        dil = dil_serie.get((fy, q), {}).get("val")
+    for slut in senaste:
+        revenue = rev_serie.get(slut, {}).get("val")
+        revenue_da = _hitta_yoy_varde(rev_serie, slut)
+        eps = eps_serie.get(slut, {}).get("val")
+        eps_da = _hitta_yoy_varde(eps_serie, slut)
+        ni = ni_serie.get(slut, {}).get("val")
+        dil = dil_serie.get(slut, {}).get("val")
 
         rev_tv = berakna_stabil_tillvaxt(revenue, revenue_da)
         eps_tv = berakna_stabil_tillvaxt(eps, eps_da)
