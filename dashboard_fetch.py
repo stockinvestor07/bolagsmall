@@ -476,6 +476,22 @@ def _konvertera(varde):
     return varde
 
 
+def _varden_matchar(original, aterlast):
+    """Jämför skrivet värde mot återläst värde från Sheets. Ren strängjämförelse
+    ('92.0' != '92') gav falska verifieringsfel eftersom Sheets normaliserar
+    numeriska värden vid lagring. Faller tillbaka på strängjämförelse för
+    icke-numeriska värden (t.ex. 'N/A')."""
+    if aterlast is None:
+        return False
+    original_str, aterlast_str = str(original).strip(), str(aterlast).strip()
+    if original_str == aterlast_str:
+        return True
+    try:
+        return abs(float(original_str) - float(aterlast_str.replace(",", ""))) < 1e-6
+    except (ValueError, TypeError):
+        return False
+
+
 def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
@@ -492,14 +508,14 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
         varde = _konvertera(varde)
         ws.update_acell(cell, varde)
         lastvarde = ws.acell(cell).value
-        if str(lastvarde) != str(varde):
+        if not _varden_matchar(varde, lastvarde):
             fel.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}'")
 
     kol_start, kol_slut = KVARTAL_KOLUMNER[0], KVARTAL_KOLUMNER[-1]
 
     def skriv_rad(rad_nr, faltnamn):
         varden = [_konvertera(kv.get(faltnamn, "N/A")) for kv in kvartalshistorik]
-        ws.update(f"{kol_start}{rad_nr}:{kol_slut}{rad_nr}", [varden])
+        ws.update(range_name=f"{kol_start}{rad_nr}:{kol_slut}{rad_nr}", values=[varden])
 
     if kvartalshistorik:
         skriv_rad(RAD_REVENUE, "revenue")
@@ -514,7 +530,7 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
     surprise_kol_start, surprise_kol_slut = KVARTAL_KOLUMNER[-4], KVARTAL_KOLUMNER[-1]
     surprise_pad = surprise_lista[-4:]
     surprise_pad = ["N/A"] * (4 - len(surprise_pad)) + surprise_pad
-    ws.update(f"{surprise_kol_start}{RAD_SURPRISE}:{surprise_kol_slut}{RAD_SURPRISE}", [surprise_pad])
+    ws.update(range_name=f"{surprise_kol_start}{RAD_SURPRISE}:{surprise_kol_slut}{RAD_SURPRISE}", values=[surprise_pad])
 
     return fel
 
