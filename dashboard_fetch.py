@@ -41,6 +41,7 @@ _frame_cache = {}
 # CELLMAPPNING - skalära fält
 # ============================================================
 CELL_MAP = {
+    "ticker": "D1",
     "roe": "P4",
     "current_ratio": "P5",
     "soliditet": "P6",
@@ -514,6 +515,8 @@ def main():
         print(f"Varning: Kunde inte hitta CIK för {ticker}.")
         data["earnings_rank"] = "N/A"
         data["sales_rank"] = "N/A"
+
+    data["ticker"] = ticker
 
     print("Skriver till Google Sheets...")
     fel = skriv_till_sheets(data, kvartalshistorik, surprise_lista)
