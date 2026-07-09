@@ -9,6 +9,24 @@ Q4 härleds: Årsvärde (10-K) - Q1 - Q2 - Q3, endast för summerbara mått
 (Revenue, Net Income, EPS). Diluted Shares är ett genomsnitt och kan inte
 härledas via subtraktion - Q4 blir N/A där, övriga kvartal hämtas direkt.
 IBD Company Rank, IBD Sector Rank, Trend Stage fylls INTE i (manuellt).
+
+--------------------------------------------------------------------------
+TAGG-VAL (v2 — patch 2026-07-09):
+Bolag rapporterar ofta revenue/EPS under FLERA parallella us-gaap-taggar
+samtidigt (t.ex. en aggregerad "Revenues"-tagg + en delmängdstagg som
+"RevenueFromContractWithCustomerExcludingAssessedTax" för enbart ASC 606-
+intäkter). Föregående version valde blint den FÖRSTA taggen i prioritets-
+listan som hade NÅGON giltig kvartalsdata, oavsett om den faktiskt
+representerade total revenue. För SEZL gav det ~54% av verklig revenue
+(delmängd vald istället för total).
+
+Ny logik (_valj_basta_tagg_serie): utvärderar ALLA kandidattaggar, bygger
+diskret kvartalsserie för var och en, och väljer den vars SENASTE kvartal
+har (1) nyast datum, och vid oavgjort datum (2) STÖRST värde — eftersom en
+total aldrig kan vara mindre än en delmängd av sig själv. Vald tagg loggas
+för audit-spårbarhet. Detta generaliserar fixen till samtliga bolag utan
+att hårdkoda bolagsspecifika taggnamn.
+--------------------------------------------------------------------------
 """
 
 import os
@@ -24,12 +42,17 @@ from scipy.stats import percentileofscore
 
 HEADERS = {"User-Agent": "Anton Werner anton.js.werner@gmail.com"}
 
-EPS_PRIMARY_TAG = "EarningsPerShareDiluted"
-EPS_FALLBACK_TAG = "EarningsPerShareBasicAndDiluted"
+# Prioritetsordning används endast som utgångsläge/dokumentation.
+# _valj_basta_tagg_serie() utvärderar samtliga taggar oavsett ordning.
+EPS_TAGGAR = [
+    "EarningsPerShareDiluted",
+    "EarningsPerShareBasicAndDiluted",
+    "EarningsPerShareBasic",
+]
 SALES_TAGGAR = [
-    "RevenueFromContractWithCustomerExcludingAssessedTax",
-    "RevenueFromContractWithCustomerIncludingAssessedTax",
     "Revenues",
+    "RevenueFromContractWithCustomerIncludingAssessedTax",
+    "RevenueFromContractWithCustomerExcludingAssessedTax",
     "SalesRevenueNet",
 ]
 NI_TAGG = "NetIncomeLoss"
@@ -204,31 +227,63 @@ def hamta_yfinance_data(ticker):
 # ============================================================
 # SEC EDGAR - kvartalshistorik med durationsfilter (Q1-Q3 diskreta, Q4 härledd)
 # ============================================================
-def _diskreta_kvartal(gaap, taggar, enhet):
-    """{end_datum: {'val','filed'}} - ENDAST poster med periodlängd 79-103 dagar.
-    Nycklar på SLUTDATUM, inte fy/fp - SEC taggar jämförelseperiod (förra året)
-    med SAMMA fy/fp som aktuell period, vilket gör fy/fp opålitligt som nyckel."""
-    for tagg in taggar:
-        if tagg not in gaap:
+def _bygg_serie_for_tagg(gaap, tagg, enhet):
+    """{end_datum: {'val','filed'}} för EN tagg - ENDAST poster med
+    periodlängd 79-103 dagar (10-Q/10-Q/A). Nycklar på SLUTDATUM eftersom
+    SEC taggar jämförelseperioder (förra året) med samma fy/fp som
+    aktuell period, vilket gör fy/fp opålitligt som nyckel."""
+    if tagg not in gaap:
+        return {}
+    poster = gaap[tagg]["units"].get(enhet, [])
+    serie = {}
+    for p in poster:
+        form = p.get("form")
+        start, end = p.get("start"), p.get("end")
+        if form not in ("10-Q", "10-Q/A") or not start or not end:
             continue
-        poster = gaap[tagg]["units"].get(enhet, [])
-        serie = {}
-        for p in poster:
-            form = p.get("form")
-            start, end = p.get("start"), p.get("end")
-            if form not in ("10-Q", "10-Q/A") or not start or not end:
-                continue
-            try:
-                d = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
-            except Exception:
-                continue
-            if not (79 <= d <= 103):
-                continue
-            if end not in serie or p.get("filed", "") > serie[end].get("filed", ""):
-                serie[end] = {"val": p["val"], "filed": p.get("filed", "")}
+        try:
+            d = (datetime.strptime(end, "%Y-%m-%d") - datetime.strptime(start, "%Y-%m-%d")).days
+        except Exception:
+            continue
+        if not (79 <= d <= 103):
+            continue
+        if end not in serie or p.get("filed", "") > serie[end].get("filed", ""):
+            serie[end] = {"val": p["val"], "filed": p.get("filed", "")}
+    return serie
+
+
+def _valj_basta_tagg_serie(gaap, taggar, enhet, faltnamn=""):
+    """Utvärderar SAMTLIGA kandidattaggar (inte bara första träffen) och
+    väljer den vars senaste kvartal har (1) nyast slutdatum, och vid
+    oavgjort datum (2) störst värde. Detta skyddar mot att en
+    delmängdstagg (t.ex. ASC 606-only revenue) väljs istället för en
+    aggregerad totaltagg - en total kan aldrig vara mindre än en
+    delmängd av sig själv vid samma periodslut.
+
+    Returnerar (serie, vald_tagg).
+    """
+    kandidater = []
+    for tagg in taggar:
+        serie = _bygg_serie_for_tagg(gaap, tagg, enhet)
         if serie:
-            return serie, tagg
-    return {}, None
+            senaste_datum = max(serie.keys())
+            senaste_varde = serie[senaste_datum]["val"]
+            kandidater.append((senaste_datum, senaste_varde, tagg, serie))
+
+    if not kandidater:
+        return {}, None
+
+    kandidater.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    vald_datum, vald_varde, vald_tagg, vald_serie = kandidater[0]
+
+    if len(kandidater) > 1:
+        ovriga = ", ".join(f"{k[2]} ({k[0]}={k[1]:,.0f})" for k in kandidater[1:])
+        print(f"  [{faltnamn or 'tagg'}] Flera kandidater hittades. "
+              f"Vald: {vald_tagg} ({vald_datum}={vald_varde:,.0f}). Ej valda: {ovriga}")
+    else:
+        print(f"  [{faltnamn or 'tagg'}] Vald tagg: {vald_tagg} ({vald_datum}={vald_varde:,.0f})")
+
+    return vald_serie, vald_tagg
 
 
 def _arsvarde(gaap, tagg, enhet):
@@ -251,9 +306,11 @@ def _arsvarde(gaap, tagg, enhet):
     return serie
 
 
-def _bygg_kvartalsserie(gaap, taggar, enhet, harled_q4):
-    """{end_datum: {'val'}} inkl. härledd Q4 (Årsvärde - de 3 föregående kvartalsslut inom samma räkenskapsår)."""
-    q_serie, tagg = _diskreta_kvartal(gaap, taggar, enhet)
+def _bygg_kvartalsserie(gaap, taggar, enhet, harled_q4, faltnamn=""):
+    """{end_datum: {'val'}} inkl. härledd Q4 (Årsvärde - de 3 föregående
+    kvartalsslut inom samma räkenskapsår). Väljer bästa tagg via
+    _valj_basta_tagg_serie() istället för att blint ta första träff."""
+    q_serie, tagg = _valj_basta_tagg_serie(gaap, taggar, enhet, faltnamn)
     if not q_serie:
         return {}
     resultat = dict(q_serie)
@@ -288,10 +345,10 @@ def _hitta_yoy_varde(serie, slutdatum_str):
 
 def hamta_kvartalshistorik(gaap):
     """8 senaste kvartalen, äldst->nyast, nycklade på slutdatum."""
-    rev_serie = _bygg_kvartalsserie(gaap, SALES_TAGGAR, "USD", harled_q4=True)
-    ni_serie = _bygg_kvartalsserie(gaap, [NI_TAGG], "USD", harled_q4=True)
-    eps_serie = _bygg_kvartalsserie(gaap, [EPS_PRIMARY_TAG, EPS_FALLBACK_TAG], "USD/shares", harled_q4=True)
-    dil_serie = _bygg_kvartalsserie(gaap, [DIL_SHARES_TAGG], "shares", harled_q4=False)
+    rev_serie = _bygg_kvartalsserie(gaap, SALES_TAGGAR, "USD", harled_q4=True, faltnamn="revenue")
+    ni_serie = _bygg_kvartalsserie(gaap, [NI_TAGG], "USD", harled_q4=True, faltnamn="net_income")
+    eps_serie = _bygg_kvartalsserie(gaap, EPS_TAGGAR, "USD/shares", harled_q4=True, faltnamn="eps")
+    dil_serie = _bygg_kvartalsserie(gaap, [DIL_SHARES_TAGG], "shares", harled_q4=False, faltnamn="dil_shares")
 
     if not rev_serie:
         return []
@@ -359,59 +416,37 @@ def sec_edgar_data_och_ranks(ticker, cik_str, falt_saknas):
             cl = _senaste_varde(gaap, "LiabilitiesCurrent")
             resultat["current_ratio"] = round(ca / cl, 2) if ca and cl else "N/A"
 
-        # --- EARNINGS RANK ---
-        eps_tagg = EPS_PRIMARY_TAG if EPS_PRIMARY_TAG in gaap else (EPS_FALLBACK_TAG if EPS_FALLBACK_TAG in gaap else None)
-        if eps_tagg:
-            eps_enheter = gaap[eps_tagg].get("units", {}).get("USD/shares", [])
-            eps_giltiga = [x for x in eps_enheter if x.get("form") in ["10-Q", "10-Q/A", "10-K", "10-K/A"]]
-            if eps_giltiga:
-                eps_giltiga.sort(key=lambda x: x.get("filed", ""))
-                senaste = eps_giltiga[-1]
-                eps_nu = senaste["val"]
-                dt = datetime.strptime(senaste["filed"], "%Y-%m-%d")
-                gissad_ar = dt.year
-                gissad_q = 4 if dt.month in [1, 2, 3] else (1 if dt.month in [4, 5, 6] else (2 if dt.month in [7, 8, 9] else 3))
-                if dt.month in [1, 2, 3]:
-                    gissad_ar -= 1
+        # --- EARNINGS RANK --- (använder samma robusta taggval som EPS ovan)
+        eps_serie_for_rank, eps_tagg = _valj_basta_tagg_serie(gaap, EPS_TAGGAR, "USD/shares", "earnings_rank")
+        if eps_serie_for_rank and eps_tagg:
+            senaste_datum = max(eps_serie_for_rank.keys())
+            eps_nu = eps_serie_for_rank[senaste_datum]["val"]
+            dt = datetime.strptime(senaste_datum, "%Y-%m-%d")
+            gissad_ar, gissad_q = dt.year, (dt.month - 1) // 3 + 1
 
-                period = verifiera_kalenderkvartal_generic(cik_str, eps_tagg, gissad_ar, gissad_q, eps_nu, "USD-per-shares")
-                if period:
-                    ar, q = period
-                    nu_dict = hamta_frame_cachad(eps_tagg, f"CY{ar}Q{q}", "USD-per-shares")
-                    da_dict = hamta_frame_cachad(eps_tagg, f"CY{ar-1}Q{q}", "USD-per-shares")
-                    universum = []
-                    for c, v_nu in nu_dict.items():
-                        if c in da_dict:
-                            tv = berakna_stabil_tillvaxt(v_nu, da_dict[c])
-                            if tv is not None:
-                                universum.append(tv)
-                    target = berakna_stabil_tillvaxt(eps_nu, da_dict.get(cik_str))
-                    if target is not None:
-                        if target not in universum:
-                            universum.append(target)
-                        resultat["earnings_rank"] = round(percentileofscore(universum, target, kind="weak"))
+            period = verifiera_kalenderkvartal_generic(cik_str, eps_tagg, gissad_ar, gissad_q, eps_nu, "USD-per-shares")
+            if period:
+                ar, q = period
+                nu_dict = hamta_frame_cachad(eps_tagg, f"CY{ar}Q{q}", "USD-per-shares")
+                da_dict = hamta_frame_cachad(eps_tagg, f"CY{ar-1}Q{q}", "USD-per-shares")
+                universum = []
+                for c, v_nu in nu_dict.items():
+                    if c in da_dict:
+                        tv = berakna_stabil_tillvaxt(v_nu, da_dict[c])
+                        if tv is not None:
+                            universum.append(tv)
+                target = berakna_stabil_tillvaxt(eps_nu, da_dict.get(cik_str))
+                if target is not None:
+                    if target not in universum:
+                        universum.append(target)
+                    resultat["earnings_rank"] = round(percentileofscore(universum, target, kind="weak"))
 
-        # --- SALES RANK ---
-        sales_tagg, sales_kvartal = None, []
-        for tg in SALES_TAGGAR:
-            if tg not in gaap:
-                continue
-            kvartal = []
-            for p in gaap[tg]["units"].get("USD", []):
-                if p.get("form") not in ("10-Q", "10-Q/A"):
-                    continue
-                try:
-                    d = (datetime.strptime(p["end"], "%Y-%m-%d") - datetime.strptime(p["start"], "%Y-%m-%d")).days
-                    if 79 <= d <= 103:
-                        kvartal.append((datetime.strptime(p["end"], "%Y-%m-%d"), p["val"]))
-                except Exception:
-                    continue
-            if kvartal:
-                sales_tagg, sales_kvartal = tg, kvartal
-                break
-
-        if sales_tagg and sales_kvartal:
-            slutdatum, kant_varde = max(sales_kvartal, key=lambda x: x[0])
+        # --- SALES RANK --- (använder samma robusta taggval som revenue ovan)
+        sales_serie_for_rank, sales_tagg = _valj_basta_tagg_serie(gaap, SALES_TAGGAR, "USD", "sales_rank")
+        if sales_serie_for_rank and sales_tagg:
+            slutdatum_str = max(sales_serie_for_rank.keys())
+            kant_varde = sales_serie_for_rank[slutdatum_str]["val"]
+            slutdatum = datetime.strptime(slutdatum_str, "%Y-%m-%d")
             period = verifiera_kalenderkvartal_generic(
                 cik_str, sales_tagg, slutdatum.year, (slutdatum.month - 1) // 3 + 1, kant_varde, "USD"
             )
