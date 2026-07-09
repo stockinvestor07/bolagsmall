@@ -20,7 +20,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install yfinance gspread google-auth requests scipy
+        run: pip install yfinance gspread google-auth requests scipy pandas lxml
 
       - name: Run dashboard fetch
         env:
