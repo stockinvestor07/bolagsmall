@@ -27,6 +27,21 @@ total aldrig kan vara mindre än en delmängd av sig själv. Vald tagg loggas
 för audit-spårbarhet. Detta generaliserar fixen till samtliga bolag utan
 att hårdkoda bolagsspecifika taggnamn.
 --------------------------------------------------------------------------
+EARNINGS-RÖRELSE (v3 — patch 2026-07-09):
+Rad 13 ("% Aktierörelse 5hd efter") — kursrörelse 5 handelsdagar efter
+earnings, endast senaste 4 kvartal (kolumn G:J, samma mönster som Surprise
+på rad 12). Baseline (dag 0) väljs beroende på rapporttid:
+  - BMO (before market open): dag0 = stängning handelsdagen INNAN rapport
+  - AMC (after market close): dag0 = stängning rapportdagen (marknaden
+    hann inte reagera samma dag)
+Dag 5 = 5:e handelsdagen efter dag0. Rörelse = (close_dag5 - close_dag0) /
+close_dag0. BMO/AMC avgörs av faktisk timestamp per rapporttillfälle
+(t.hour < 12), INTE ett statiskt bolagsantagande — hanterar korrekt även
+enstaka avvikelser där ett bolag byter rapporteringstid en enskild gång.
+Verifierat mot yfinance get_earnings_dates() för SEZL/AAPL/MU/VRT/KRYS:
+tidsstämplar stabila och tillförlitliga per rapporttillfälle.
+Framtida (ej ännu inträffade) rapportdatum filtreras bort automatiskt.
+--------------------------------------------------------------------------
 """
 
 import os
@@ -92,6 +107,7 @@ RAD_EPS = 8
 RAD_EPS_TILLVAXT = 9
 RAD_DIL_SHARES = 11
 RAD_SURPRISE = 12
+RAD_EARNINGS_RORELSE = 13
 RAD_MARGINAL = 14
 
 SHEET_ID = os.environ["SHEET_ID"]
@@ -144,6 +160,77 @@ def verifiera_kalenderkvartal_generic(cik_str, tagg, gissad_ar, gissad_q, eget_v
         if frame.get(cik_str) == eget_varde:
             return ar, q
     return None
+
+
+# ============================================================
+# EARNINGS-RÖRELSE 5 HANDELSDAGAR EFTER (rad 13, G:J = senaste 4 kvartal)
+# ============================================================
+def _berakna_rorelse_5hd(hist, rapport_dt, is_bmo):
+    """hist: DataFrame med tz-naive DatetimeIndex och 'Close'-kolumn,
+    redan avgränsad runt rapport_dt. Returnerar rörelse-% eller None."""
+    if hist.empty:
+        return None
+    handelsdagar = hist.index.sort_values()
+    rap_naive = pd.Timestamp(rapport_dt.date())
+
+    dag0_kand = handelsdagar[handelsdagar < rap_naive] if is_bmo else handelsdagar[handelsdagar <= rap_naive]
+    if len(dag0_kand) == 0:
+        return None
+    dag0 = dag0_kand[-1]
+
+    dagar_efter = handelsdagar[handelsdagar > dag0]
+    if len(dagar_efter) < 5:
+        return None
+    dag5 = dagar_efter[4]
+
+    c0 = hist.loc[dag0, "Close"]
+    c5 = hist.loc[dag5, "Close"]
+    if not c0:
+        return None
+    return round((c5 - c0) / c0 * 100, 1)
+
+
+def hamta_earnings_rorelse(ticker, t=None, antal=4):
+    """Senaste `antal` (icke-framtida) rapporttillfällen, äldst->nyast.
+    Returnerar lista med `antal` värden (float eller 'N/A'), pad i början
+    om färre än `antal` finns tillgängliga."""
+    if t is None:
+        t = yf.Ticker(ticker)
+
+    try:
+        ed = t.get_earnings_dates(limit=12)
+    except Exception as e:
+        print(f"  [earnings_rorelse] get_earnings_dates misslyckades: {e}")
+        return ["N/A"] * antal
+
+    if ed is None or ed.empty:
+        return ["N/A"] * antal
+
+    nu = pd.Timestamp.now(tz=ed.index.tz)
+    forflutna = ed.index[ed.index < nu].sort_values()[-antal:]
+
+    if len(forflutna) == 0:
+        return ["N/A"] * antal
+
+    start = forflutna.min() - pd.Timedelta(days=20)
+    slut = forflutna.max() + pd.Timedelta(days=20)
+    try:
+        hist = t.history(start=start, end=slut)
+        hist.index = hist.index.tz_localize(None)
+    except Exception as e:
+        print(f"  [earnings_rorelse] history-hämtning misslyckades: {e}")
+        return ["N/A"] * antal
+
+    resultat = []
+    for dt in forflutna:
+        is_bmo = dt.hour < 12
+        rorelse = _berakna_rorelse_5hd(hist, dt.to_pydatetime(), is_bmo)
+        resultat.append(rorelse if rorelse is not None else "N/A")
+
+    while len(resultat) < antal:
+        resultat.insert(0, "N/A")
+
+    return resultat
 
 
 # ============================================================
@@ -220,6 +307,8 @@ def hamta_yfinance_data(ticker):
     except Exception as e:
         print(f"Surprise-hämtning misslyckades: {e}")
         resultat["_surprise_lista"] = []
+
+    resultat["_earnings_rorelse_lista"] = hamta_earnings_rorelse(ticker, t=t, antal=4)
 
     return resultat
 
@@ -492,7 +581,7 @@ def _varden_matchar(original, aterlast):
         return False
 
 
-def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
+def skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_lista):
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
@@ -527,10 +616,16 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista):
     else:
         fel.append("kvartalshistorik: ingen data hämtad från SEC EDGAR")
 
-    surprise_kol_start, surprise_kol_slut = KVARTAL_KOLUMNER[-4], KVARTAL_KOLUMNER[-1]
+    # Senaste 4 kvartal = kolumn G:J (samma mönster för Surprise och Earnings-rörelse)
+    kol4_start, kol4_slut = KVARTAL_KOLUMNER[-4], KVARTAL_KOLUMNER[-1]
+
     surprise_pad = surprise_lista[-4:]
     surprise_pad = ["N/A"] * (4 - len(surprise_pad)) + surprise_pad
-    ws.update(range_name=f"{surprise_kol_start}{RAD_SURPRISE}:{surprise_kol_slut}{RAD_SURPRISE}", values=[surprise_pad])
+    ws.update(range_name=f"{kol4_start}{RAD_SURPRISE}:{kol4_slut}{RAD_SURPRISE}", values=[surprise_pad])
+
+    rorelse_pad = earnings_rorelse_lista[-4:]
+    rorelse_pad = ["N/A"] * (4 - len(rorelse_pad)) + rorelse_pad
+    ws.update(range_name=f"{kol4_start}{RAD_EARNINGS_RORELSE}:{kol4_slut}{RAD_EARNINGS_RORELSE}", values=[rorelse_pad])
 
     return fel
 
@@ -544,6 +639,7 @@ def main():
     print(f"Hämtar data för {ticker}...")
     data = hamta_yfinance_data(ticker)
     surprise_lista = data.pop("_surprise_lista", [])
+    earnings_rorelse_lista = data.pop("_earnings_rorelse_lista", [])
 
     cik_str = None
     try:
@@ -570,7 +666,7 @@ def main():
     data["ticker"] = ticker
 
     print("Skriver till Google Sheets...")
-    fel = skriv_till_sheets(data, kvartalshistorik, surprise_lista)
+    fel = skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_lista)
 
     if fel:
         print("VARNING - verifieringsfel:")
