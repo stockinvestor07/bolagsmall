@@ -42,6 +42,15 @@ Verifierat mot yfinance get_earnings_dates() för SEZL/AAPL/MU/VRT/KRYS:
 tidsstämplar stabila och tillförlitliga per rapporttillfälle.
 Framtida (ej ännu inträffade) rapportdatum filtreras bort automatiskt.
 --------------------------------------------------------------------------
+VERIFIERING (v4 — patch 2026-07-10):
+Sheets normaliserar/avrundar numeriska värden vid lagring (t.ex. skrivet
+1.015 visas/läses som 1.02). Tidigare gav detta falska fatala fel (exit 1)
+trots att skrivningen var korrekt. Ny logik särskiljer:
+  - Avrundningsdiff (liten avvikelse, |diff| <= AVRUNDNING_TOLERANS eller
+    <= 1% relativt) -> loggas som varning, stoppar INTE workflow.
+  - Äkta fel (None/tomt återläst värde, eller större avvikelse) -> loggas
+    som fel, stoppar workflow (exit 1) som tidigare.
+--------------------------------------------------------------------------
 """
 
 import os
@@ -72,6 +81,10 @@ SALES_TAGGAR = [
 ]
 NI_TAGG = "NetIncomeLoss"
 DIL_SHARES_TAGG = "WeightedAverageNumberOfDilutedSharesOutstanding"
+
+# Verifieringstoleranser vid jämförelse skrivet vs. återläst Sheets-värde.
+AVRUNDNING_TOLERANS_ABSOLUT = 0.01   # t.ex. 1.015 vs 1.02
+AVRUNDNING_TOLERANS_RELATIV = 0.01   # 1% relativ avvikelse
 
 _frame_cache = {}
 
@@ -565,20 +578,45 @@ def _konvertera(varde):
     return varde
 
 
-def _varden_matchar(original, aterlast):
-    """Jämför skrivet värde mot återläst värde från Sheets. Ren strängjämförelse
-    ('92.0' != '92') gav falska verifieringsfel eftersom Sheets normaliserar
-    numeriska värden vid lagring. Faller tillbaka på strängjämförelse för
-    icke-numeriska värden (t.ex. 'N/A')."""
-    if aterlast is None:
-        return False
+def _jamfor_varden(original, aterlast):
+    """Jämför skrivet värde mot återläst värde från Sheets.
+
+    Returnerar en av: 'match', 'avrundning', 'fel'.
+
+    - 'match': identiska (sträng- eller exakt numerisk jämförelse).
+    - 'avrundning': numeriskt värde men Sheets har avrundat/normaliserat
+      vid lagring (t.ex. 1.015 -> 1.02). Skiljs ut med absolut tolerans
+      (AVRUNDNING_TOLERANS_ABSOLUT) ELLER relativ tolerans
+      (AVRUNDNING_TOLERANS_RELATIV), vilket som är mest tillåtande för
+      värdet i fråga. Detta är INTE ett fel, bara Sheets cellformatering.
+    - 'fel': återläst värde saknas (None/tom sträng), eller numerisk
+      avvikelse större än toleransen, eller icke-numeriskt värde som
+      inte matchar exakt.
+    """
+    if aterlast is None or str(aterlast).strip() == "":
+        return "fel"
+
     original_str, aterlast_str = str(original).strip(), str(aterlast).strip()
     if original_str == aterlast_str:
-        return True
+        return "match"
+
     try:
-        return abs(float(original_str) - float(aterlast_str.replace(",", ""))) < 1e-6
+        o = float(original_str)
+        a = float(aterlast_str.replace(",", ""))
     except (ValueError, TypeError):
-        return False
+        # Icke-numeriskt och strängarna matchade inte exakt -> äkta fel.
+        return "fel"
+
+    diff = abs(o - a)
+    if diff < 1e-6:
+        return "match"
+
+    relativ_grans = abs(o) * AVRUNDNING_TOLERANS_RELATIV
+    tolerans = max(AVRUNDNING_TOLERANS_ABSOLUT, relativ_grans)
+    if diff <= tolerans:
+        return "avrundning"
+
+    return "fel"
 
 
 def skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_lista):
@@ -589,6 +627,7 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_l
     ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
 
     fel = []
+    avrundningsvarningar = []
 
     for falt, varde in data.items():
         cell = CELL_MAP.get(falt)
@@ -597,7 +636,10 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_l
         varde = _konvertera(varde)
         ws.update_acell(cell, varde)
         lastvarde = ws.acell(cell).value
-        if not _varden_matchar(varde, lastvarde):
+        status = _jamfor_varden(varde, lastvarde)
+        if status == "avrundning":
+            avrundningsvarningar.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}' (avrundning, ej fel)")
+        elif status == "fel":
             fel.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}'")
 
     kol_start, kol_slut = KVARTAL_KOLUMNER[0], KVARTAL_KOLUMNER[-1]
@@ -627,7 +669,7 @@ def skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_l
     rorelse_pad = ["N/A"] * (4 - len(rorelse_pad)) + rorelse_pad
     ws.update(range_name=f"{kol4_start}{RAD_EARNINGS_RORELSE}:{kol4_slut}{RAD_EARNINGS_RORELSE}", values=[rorelse_pad])
 
-    return fel
+    return fel, avrundningsvarningar
 
 
 def main():
@@ -666,7 +708,12 @@ def main():
     data["ticker"] = ticker
 
     print("Skriver till Google Sheets...")
-    fel = skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_lista)
+    fel, avrundningsvarningar = skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_lista)
+
+    if avrundningsvarningar:
+        print("INFO - avrundning vid Sheets-lagring (ej fel):")
+        for v in avrundningsvarningar:
+            print(f"  {v}")
 
     if fel:
         print("VARNING - verifieringsfel:")
