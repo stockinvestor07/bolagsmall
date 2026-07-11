@@ -326,7 +326,12 @@ def hamta_earnings_rorelse(ticker, t=None, antal=4, hist=None):
 
     behover_egen_hamtning = hist is None or hist.empty
     if not behover_egen_hamtning:
+        # forflutna kommer från ed.index (tz-aware), medan den återanvända
+        # hist_1y redan är tz-naiv (tz_localize(None) i hamta_yfinance_data).
+        # Måste normalisera till tz-naiv innan jämförelse, annars TypeError.
         min_behov = forflutna.min() - pd.Timedelta(days=20)
+        if min_behov.tzinfo is not None:
+            min_behov = min_behov.tz_localize(None)
         if hist.index.min() > min_behov:
             behover_egen_hamtning = True  # den återanvända historiken räcker inte bakåt
 
