@@ -1,0 +1,24 @@
+name: RS Rating Update
+on:
+  schedule:
+    # Måndag och torsdag kl 11:00 UTC. GitHub Actions cron kör i UTC,
+    # så justera timmen om du vill träffa en specifik lokal tid.
+    - cron: "0 11 * * 1,4"
+  workflow_dispatch: {}
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install yfinance gspread google-auth requests scipy pandas lxml
+      - name: Run RS rating update
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: python rs_rating_update.py
