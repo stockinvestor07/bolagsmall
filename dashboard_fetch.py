@@ -9,21 +9,33 @@ Q4 härleds: Årsvärde (10-K) - Q1 - Q2 - Q3, endast för summerbara mått
 (Revenue, Net Income, EPS). Diluted Shares är ett genomsnitt och kan inte
 härledas via subtraktion - Q4 blir N/A där, övriga kvartal hämtas direkt.
 IBD Company Rank, IBD Sector Rank, Trend Stage fylls INTE i (manuellt).
+
+RS RATING: beräknas normalt INTE här. Hela universumet (~3000 bolag)
+räknas om av det separata scriptet rs_rating_update.py, som körs
+schemalagt måndag + torsdag och skriver resultatet till Sheets-fliken
+"RS_Cache". Detta script läser bara upp cachat värde för aktuell ticker -
+MEN om cachen saknas eller är äldre än RS_CACHE_MAX_ALDER_DAGAR (t.ex.
+om det schemalagda jobbet missades) körs rs_rating_update.py som en
+engångs-fallback här innan uppslaget görs, så dashboarden aldrig
+tyst arbetar med kraftigt inaktuell RS-data.
 """
 
 import os
 import sys
+import time
 import json
 import requests
 import yfinance as yf
 import pandas as pd
 import gspread
 from google.oauth2.service_account import Credentials
-from datetime import datetime
+from datetime import datetime, timezone
 from scipy.stats import percentileofscore
 from concurrent.futures import ThreadPoolExecutor
 
-HEADERS = {"User-Agent": "Anton Werner anton.js.werner@gmail.com"}
+USER_AGENT = os.environ.get("SEC_USER_AGENT", "Anton Werner anton.js.werner@gmail.com")
+HEADERS = {"User-Agent": USER_AGENT}
+REQUEST_TIMEOUT = 15
 
 EPS_TAGGAR = [
     "EarningsPerShareDiluted",
@@ -79,8 +91,42 @@ RAD_SURPRISE = 12
 RAD_EARNINGS_RORELSE = 13
 RAD_MARGINAL = 15
 
+TOM_KVARTAL = {
+    "revenue": "N/A", "revenue_tillvaxt": "N/A", "eps": "N/A",
+    "eps_tillvaxt": "N/A", "dil_shares": "N/A", "marginal": "N/A",
+}
+
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = "Dashboard"
+RS_CACHE_TAB = "RS_Cache"
+RS_CACHE_MAX_ALDER_DAGAR = 5  # måndag->torsdag = 3 dagar, torsdag->måndag = 4 dagar
+
+
+def pad_left(lista, n, fyllvarde="N/A"):
+    """Vänsterpaddar en lista till längd n. fyllvarde kan vara en callable
+    (t.ex. lambda: dict(...)) om varje saknad post behöver vara ett eget objekt."""
+    lista = list(lista[-n:])
+    brist = n - len(lista)
+    if brist <= 0:
+        return lista
+    fyllda = [fyllvarde() if callable(fyllvarde) else fyllvarde for _ in range(brist)]
+    return fyllda + lista
+
+
+def hamta_med_retry(url, headers=None, forsok=3, backoff=2):
+    """Retry med exponentiell backoff + explicit timeout (saknades helt tidigare)."""
+    for i in range(forsok):
+        try:
+            r = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            if r.status_code == 200:
+                return r
+            print(f"  [retry] {url} -> HTTP {r.status_code} (försök {i + 1}/{forsok})")
+        except requests.RequestException as e:
+            print(f"  [retry] {url} -> {e} (försök {i + 1}/{forsok})")
+        if i < forsok - 1:
+            time.sleep(backoff * (i + 1))
+    return None
+
 
 def _pct(varde):
     if varde is None:
@@ -90,11 +136,13 @@ def _pct(varde):
     except Exception:
         return "N/A"
 
+
 def berakna_stabil_tillvaxt(nu, da):
     if nu is None or da is None or da == 0:
         return None
     justerad_namnare = max(abs(da), 0.05)
     return (nu - da) / justerad_namnare
+
 
 def hamta_frame_cachad(tagg, period, enhet="USD"):
     key = (tagg, period, enhet)
@@ -102,14 +150,15 @@ def hamta_frame_cachad(tagg, period, enhet="USD"):
         return _frame_cache[key]
     url = f"https://data.sec.gov/api/xbrl/frames/us-gaap/{tagg}/{enhet}/{period}.json"
     resultat = {}
-    try:
-        r = requests.get(url, headers=HEADERS)
-        if r.status_code == 200:
+    r = hamta_med_retry(url, headers=HEADERS, forsok=2)
+    if r is not None:
+        try:
             resultat = {str(x["cik"]).zfill(10): x["val"] for x in r.json().get("data", [])}
-    except Exception:
-        pass
+        except Exception:
+            pass
     _frame_cache[key] = resultat
     return resultat
+
 
 def verifiera_kalenderkvartal_generic(cik_str, tagg, gissad_ar, gissad_q, eget_varde, enhet="USD"):
     kandidater = [(gissad_ar, gissad_q)]
@@ -125,6 +174,115 @@ def verifiera_kalenderkvartal_generic(cik_str, tagg, gissad_ar, gissad_q, eget_v
         if frame.get(cik_str) == eget_varde:
             return ar, q
     return None
+
+
+# ============================================================
+# RS RATING - läses från cache (se rs_rating_update.py)
+# ============================================================
+def _oppna_rs_cache_worksheet(readonly=True):
+    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"] if readonly else [
+        "https://www.googleapis.com/auth/spreadsheets"
+    ]
+    creds_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
+    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(SHEET_ID).worksheet(RS_CACHE_TAB)
+
+
+def _rs_cache_ar_farsk(max_alder_dagar):
+    """
+    Kontrollerar om RS_Cache finns och är färsk nog. Returnerar (är_farsk, rows).
+    rows är None om cachen inte kunde läsas alls (nätverksfel etc) - då avstår
+    vi från att gissa och kör ingen fallback-uppdatering.
+    """
+    try:
+        ws = _oppna_rs_cache_worksheet(readonly=True)
+        rows = ws.get_all_records()
+    except gspread.WorksheetNotFound:
+        return False, []
+    except Exception as e:
+        print(f"  [rs_rating] kunde inte kontrollera cache-status: {e}")
+        return True, None  # osäkert läge - anta färsk, försök inte trigga ombyggnad blint
+
+    if not rows:
+        return False, []
+
+    aldsta_uppdatering = None
+    for row in rows:
+        uppdaterad = row.get("Updated_At")
+        try:
+            alder = datetime.now(timezone.utc) - datetime.fromisoformat(uppdaterad)
+            if aldsta_uppdatering is None or alder > aldsta_uppdatering:
+                aldsta_uppdatering = alder
+        except Exception:
+            continue
+
+    if aldsta_uppdatering is None:
+        return False, rows  # kunde inte tolka Updated_At överhuvudtaget
+    return aldsta_uppdatering.days <= max_alder_dagar, rows
+
+
+def sakerstall_farsk_rs_cache(max_alder_dagar=RS_CACHE_MAX_ALDER_DAGAR):
+    """
+    Om cachen saknas eller är äldre än max_alder_dagar (t.ex. det schemalagda
+    mån/tors-jobbet missades en vecka) körs rs_rating_update.py:s hela
+    beräkning här som en engångs-fallback, istället för att bara logga en
+    varning och fortsätta med inaktuell data. Normalfallet (cache färsk)
+    kostar bara en läsning.
+    """
+    ar_farsk, rows = _rs_cache_ar_farsk(max_alder_dagar)
+    if rows is None:
+        return  # osäkert läge, se _rs_cache_ar_farsk
+    if ar_farsk:
+        return
+
+    print(f"  [rs_rating] cache saknas eller är äldre än {max_alder_dagar} dagar - "
+          f"kör rs_rating_update.py som fallback innan uppslag...")
+    try:
+        import rs_rating_update
+        rs_rating_update.main()
+    except SystemExit:
+        pass  # rs_rating_update.main() kan anropa sys.exit(); låt inte det avbryta dashboard-körningen
+    except Exception as e:
+        print(f"  [rs_rating] fallback-körning av rs_rating_update.py misslyckades: {e}")
+
+
+def hamta_rs_rating_fran_cache(ticker):
+    """
+    Läser förberäknat RS Rating ur fliken 'RS_Cache'. Den fliken fylls
+    normalt av det separata scriptet rs_rating_update.py, schemalagt
+    måndag + torsdag. Om cachen är för gammal körs den uppdateringen
+    här istället (se sakerstall_farsk_rs_cache), så en enskild
+    dashboard-körning aldrig arbetar med kraftigt inaktuell RS-data -
+    men den normala vägen kräver bara en Sheets-läsning.
+    """
+    sakerstall_farsk_rs_cache()
+
+    try:
+        ws = _oppna_rs_cache_worksheet(readonly=True)
+        rows = ws.get_all_records()
+    except gspread.WorksheetNotFound:
+        print(f"  [rs_rating] fliken '{RS_CACHE_TAB}' finns fortfarande inte - kunde inte läsa RS Rating.")
+        return "N/A"
+    except Exception as e:
+        print(f"  [rs_rating] kunde inte läsa cache: {e}")
+        return "N/A"
+
+    for row in rows:
+        if str(row.get("Ticker", "")).upper() == ticker.upper():
+            uppdaterad = row.get("Updated_At")
+            try:
+                alder = datetime.now(timezone.utc) - datetime.fromisoformat(uppdaterad)
+                if alder.days > RS_CACHE_MAX_ALDER_DAGAR:
+                    print(f"  [rs_rating] VARNING: cache är fortfarande {alder.days} dagar gammal "
+                          f"({uppdaterad}) trots fallback-försök.")
+            except Exception:
+                pass
+            return row.get("RS_Rank", "N/A")
+
+    print(f"  [rs_rating] {ticker} saknas i cache trots fallback-uppdatering.")
+    return "N/A"
+
 
 # ============================================================
 # EARNINGS-RÖRELSE
@@ -147,7 +305,13 @@ def _berakna_rorelse_5hd(hist, rapport_dt, is_bmo):
     if not c0: return None
     return round((c5 - c0) / c0 * 100, 1)
 
-def hamta_earnings_rorelse(ticker, t=None, antal=4):
+
+def hamta_earnings_rorelse(ticker, t=None, antal=4, hist=None):
+    """
+    hist: valfri redan hämtad (tz-naiv) prishistorik som återanvänds istället
+    för att göra ett eget nätverksanrop (se hamta_yfinance_data, som redan
+    laddar ner ~1 års historik för buy_risk-beräkningen).
+    """
     if t is None: t = yf.Ticker(ticker)
     try:
         ed = t.get_earnings_dates(limit=12)
@@ -160,14 +324,21 @@ def hamta_earnings_rorelse(ticker, t=None, antal=4):
     forflutna = ed.index[ed.index < nu].sort_values()[-antal:]
     if len(forflutna) == 0: return ["N/A"] * antal
 
-    start = forflutna.min() - pd.Timedelta(days=20)
-    slut = forflutna.max() + pd.Timedelta(days=20)
-    try:
-        hist = t.history(start=start, end=slut)
-        hist.index = hist.index.tz_localize(None)
-    except Exception as e:
-        print(f"  [earnings_rorelse] history-hämtning misslyckades: {e}")
-        return ["N/A"] * antal
+    behover_egen_hamtning = hist is None or hist.empty
+    if not behover_egen_hamtning:
+        min_behov = forflutna.min() - pd.Timedelta(days=20)
+        if hist.index.min() > min_behov:
+            behover_egen_hamtning = True  # den återanvända historiken räcker inte bakåt
+
+    if behover_egen_hamtning:
+        start = forflutna.min() - pd.Timedelta(days=20)
+        slut = forflutna.max() + pd.Timedelta(days=20)
+        try:
+            hist = t.history(start=start, end=slut)
+            hist.index = hist.index.tz_localize(None)
+        except Exception as e:
+            print(f"  [earnings_rorelse] history-hämtning misslyckades: {e}")
+            return ["N/A"] * antal
 
     resultat = []
     for dt in forflutna:
@@ -175,72 +346,8 @@ def hamta_earnings_rorelse(ticker, t=None, antal=4):
         rorelse = _berakna_rorelse_5hd(hist, dt.to_pydatetime(), is_bmo)
         resultat.append(rorelse if rorelse is not None else "N/A")
 
-    while len(resultat) < antal:
-        resultat.insert(0, "N/A")
-    return resultat
+    return pad_left(resultat, antal)
 
-# ============================================================
-# RS RATING (PARALLELL INHÄMTNING)
-# ============================================================
-def _bearbeta_rs_batch(batch):
-    lokal_rs = []
-    try:
-        raw_data = yf.download(batch, period="1y", auto_adjust=True, group_by="ticker", progress=False)
-        for ticker in batch:
-            try:
-                if ticker not in raw_data.columns.levels[0]: continue
-                close_series = raw_data[ticker]["Close"].dropna().values
-                if len(close_series) < 240: continue
-                
-                ret_3m = (close_series[-1] - close_series[-63]) / close_series[-63]
-                ret_6m = (close_series[-1] - close_series[-126]) / close_series[-126]
-                ret_9m = (close_series[-1] - close_series[-189]) / close_series[-189]
-                ret_12m = (close_series[-1] - close_series[0]) / close_series[0]
-                
-                rs_score = (ret_3m * 2) + ret_6m + ret_9m + ret_12m
-                lokal_rs.append({"Ticker": ticker, "RS_Score": rs_score})
-            except:
-                continue
-    except:
-        pass
-    return lokal_rs
-
-def hamta_rs_rating(target_ticker, sec_tickers_dict):
-    tickers = [v["ticker"].replace("-", "").replace(".", "") for v in sec_tickers_dict.values() if v["ticker"].isalpha()]
-    unika = []
-    seen = set()
-    for t in tickers:
-        if t not in seen:
-            seen.add(t)
-            unika.append(t)
-            
-    universum = unika[:3000]
-    
-    # Garantera att analys-tickern är med oavsett market cap
-    if target_ticker not in universum:
-        universum[-1] = target_ticker
-        
-    totalt = len(universum)
-    batch_storlek = 500
-    batches = [universum[i:i + batch_storlek] for i in range(0, totalt, batch_storlek)]
-    
-    master_rs_data = []
-    with ThreadPoolExecutor(max_workers=6) as executor:
-        resultat_listor = executor.map(_bearbeta_rs_batch, batches)
-        for lista in resultat_listor:
-            master_rs_data.extend(lista)
-
-    df = pd.DataFrame(master_rs_data)
-    if df.empty or "RS_Score" not in df.columns:
-        return "N/A"
-    
-    raw_scores = df["RS_Score"].values
-    df["RS_Rating"] = df["RS_Score"].apply(lambda x: int(percentileofscore(raw_scores, x, kind="weak"))).clip(1, 99)
-    
-    traff = df[df["Ticker"] == target_ticker]
-    if not traff.empty:
-        return traff["RS_Rating"].values[0]
-    return "N/A"
 
 # ============================================================
 # YFINANCE - skalära fält
@@ -262,10 +369,18 @@ def hamta_yfinance_data(ticker):
     resultat["sektor"] = info.get("sector", "N/A")
     resultat["short_percentage_of_float"] = _pct(info.get("shortPercentOfFloat"))
 
+    # Hämta 1 års historik EN gång och återanvänd för både buy_risk (MA50)
+    # och earnings-rörelse nedan, istället för två separata history()-anrop.
+    hist_1y = pd.DataFrame()
     try:
-        hist = t.history(period="3mo")
-        pris = hist["Close"].iloc[-1]
-        ma50 = hist["Close"].rolling(50).mean().iloc[-1]
+        hist_1y = t.history(period="1y")
+        hist_1y.index = hist_1y.index.tz_localize(None)
+    except Exception:
+        hist_1y = pd.DataFrame()
+
+    try:
+        pris = hist_1y["Close"].iloc[-1]
+        ma50 = hist_1y["Close"].rolling(50).mean().iloc[-1]
         resultat["buy_risk"] = _pct((pris - ma50) / ma50)
     except Exception:
         resultat["buy_risk"] = "N/A"
@@ -305,6 +420,8 @@ def hamta_yfinance_data(ticker):
     except Exception:
         resultat["pct_diff_90d_eps"] = "N/A"
 
+    # Medvetet N/A: det finns ingen motsvarande 90-dagars-trend för revenue-estimat
+    # i yfinance (till skillnad från EPS-trenden ovan). Inte en bugg, inte manuellt fält.
     resultat["pct_diff_90d_revenue"] = "N/A"
 
     try:
@@ -315,9 +432,12 @@ def hamta_yfinance_data(ticker):
         print(f"Surprise-hämtning misslyckades: {e}")
         resultat["_surprise_lista"] = []
 
-    resultat["_earnings_rorelse_lista"] = hamta_earnings_rorelse(ticker, t=t, antal=4)
+    resultat["_earnings_rorelse_lista"] = hamta_earnings_rorelse(
+        ticker, t=t, antal=4, hist=hist_1y if not hist_1y.empty else None
+    )
 
     return resultat
+
 
 # ============================================================
 # SEC EDGAR - historik & fallback
@@ -337,25 +457,38 @@ def _bygg_serie_for_tagg(gaap, tagg, enhet):
             serie[end] = {"val": p["val"], "filed": p.get("filed", "")}
     return serie
 
+
 def _valj_basta_tagg_serie(gaap, taggar, enhet, faltnamn=""):
+    """
+    Tidigare bugg: vid lika slutdatum vann kandidaten med STÖRST numeriskt
+    värde (x[1] i sorteringsnyckeln), inte den tagg som ligger högst i den
+    avsiktliga prioritetsordningen i SALES_TAGGAR/EPS_TAGGAR. Det gav en
+    godtycklig, inte en avsiktlig, tagg-vinnare.
+
+    Fix: tie-break på taggens index i listan (lägre index = högre prioritet),
+    inte på värdets storlek.
+    """
     kandidater = []
-    for tagg in taggar:
+    for prioritet, tagg in enumerate(taggar):
         serie = _bygg_serie_for_tagg(gaap, tagg, enhet)
         if serie:
             senaste_datum = max(serie.keys())
             senaste_varde = serie[senaste_datum]["val"]
-            kandidater.append((senaste_datum, senaste_varde, tagg, serie))
+            kandidater.append((senaste_datum, prioritet, senaste_varde, tagg, serie))
 
     if not kandidater: return {}, None
-    kandidater.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    vald_datum, vald_varde, vald_tagg, vald_serie = kandidater[0]
+    # Sortering: senaste datum vinner, vid lika datum vinner lägst prioritetsindex
+    kandidater.sort(key=lambda x: (x[0], -x[1]), reverse=True)
+    vald_datum, _, vald_varde, vald_tagg, vald_serie = kandidater[0]
 
     if len(kandidater) > 1:
-        ovriga = ", ".join(f"{k[2]} ({k[0]}={k[1]:,.0f})" for k in kandidater[1:])
-        print(f"  [{faltnamn or 'tagg'}] Flera kandidater hittades. Vald: {vald_tagg} ({vald_datum}={vald_varde:,.0f}). Ej valda: {ovriga}")
+        ovriga = ", ".join(f"{k[3]} ({k[0]}={k[2]:,.0f})" for k in kandidater[1:])
+        print(f"  [{faltnamn or 'tagg'}] Flera kandidater hittades. Vald: {vald_tagg} "
+              f"({vald_datum}={vald_varde:,.0f}) [prioritetsordning]. Ej valda: {ovriga}")
     else:
         print(f"  [{faltnamn or 'tagg'}] Vald tagg: {vald_tagg} ({vald_datum}={vald_varde:,.0f})")
     return vald_serie, vald_tagg
+
 
 def _arsvarde(gaap, tagg, enhet):
     poster = gaap.get(tagg, {}).get("units", {}).get(enhet, [])
@@ -370,6 +503,7 @@ def _arsvarde(gaap, tagg, enhet):
         if end not in serie or p.get("filed", "") > serie[end].get("filed", ""):
             serie[end] = {"val": p["val"], "filed": p.get("filed", "")}
     return serie
+
 
 def _bygg_kvartalsserie(gaap, taggar, enhet, harled_q4, faltnamn=""):
     q_serie, tagg = _valj_basta_tagg_serie(gaap, taggar, enhet, faltnamn)
@@ -386,6 +520,7 @@ def _bygg_kvartalsserie(gaap, taggar, enhet, harled_q4, faltnamn=""):
                 resultat[fy_end_str] = {"val": arsdata["val"] - summa, "filed": arsdata["filed"]}
     return resultat
 
+
 def _hitta_yoy_varde(serie, slutdatum_str):
     slut_dt = datetime.strptime(slutdatum_str, "%Y-%m-%d")
     try: target = slut_dt.replace(year=slut_dt.year - 1)
@@ -397,6 +532,7 @@ def _hitta_yoy_varde(serie, slutdatum_str):
         if diff < bast_diff:
             bast_key, bast_diff = e, diff
     return serie[bast_key]["val"] if bast_key else None
+
 
 def hamta_kvartalshistorik(gaap):
     rev_serie = _bygg_kvartalsserie(gaap, SALES_TAGGAR, "USD", harled_q4=True, faltnamn="revenue")
@@ -430,9 +566,8 @@ def hamta_kvartalshistorik(gaap):
             "marginal": marginal,
         })
 
-    while len(resultat) < ANTAL_KVARTAL:
-        resultat.insert(0, {"revenue": "N/A", "revenue_tillvaxt": "N/A", "eps": "N/A", "eps_tillvaxt": "N/A", "dil_shares": "N/A", "marginal": "N/A"})
-    return resultat
+    return pad_left(resultat, ANTAL_KVARTAL, fyllvarde=lambda: dict(TOM_KVARTAL))
+
 
 def _senaste_varde(gaap_facts, tagg):
     if tagg not in gaap_facts: return None
@@ -442,24 +577,51 @@ def _senaste_varde(gaap_facts, tagg):
     giltiga.sort(key=lambda x: x.get("end", ""))
     return giltiga[-1]["val"]
 
-def sec_edgar_data_och_ranks(ticker, cik_str, falt_saknas):
-    resultat = {"earnings_rank": "N/A", "sales_rank": "N/A", "kvartalshistorik": []}
-    try:
-        facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_str}.json"
-        facts = requests.get(facts_url, headers=HEADERS).json()
-        gaap = facts.get("facts", {}).get("us-gaap", {})
 
-        if "roe" in falt_saknas:
+def sec_edgar_data_och_ranks(ticker, cik_str, falt_saknas):
+    """
+    Tidigare låg ROE/current_ratio, earnings_rank, sales_rank och
+    kvartalshistorik i EN gemensam try/except. Ett oväntat fel i t.ex.
+    ROE-beräkningen gjorde att hela resten (inklusive den oberoende
+    kvartalshistoriken) aldrig kördes. Nu har varje delsteg sitt eget
+    try/except, så ett fel i en del inte dränker de andra.
+    """
+    resultat = {"earnings_rank": "N/A", "sales_rank": "N/A", "kvartalshistorik": []}
+
+    facts_url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik_str}.json"
+    r = hamta_med_retry(facts_url, headers=HEADERS)
+    if r is None:
+        print(f"  [sec_edgar] kunde inte hämta companyfacts för {ticker} efter flera försök.")
+        return resultat
+
+    try:
+        facts = r.json()
+    except Exception as e:
+        print(f"  [sec_edgar] kunde inte tolka companyfacts-JSON: {e}")
+        return resultat
+
+    gaap = facts.get("facts", {}).get("us-gaap", {})
+
+    if "roe" in falt_saknas:
+        try:
             ni = _senaste_varde(gaap, "NetIncomeLoss")
             eq = _senaste_varde(gaap, "StockholdersEquity")
             resultat["roe"] = round((ni / eq) * 100, 1) if ni and eq else "N/A"
+        except Exception as e:
+            print(f"  [sec_edgar] ROE-beräkning misslyckades: {e}")
+            resultat["roe"] = "N/A"
 
-        if "current_ratio" in falt_saknas:
+    if "current_ratio" in falt_saknas:
+        try:
             ca = _senaste_varde(gaap, "AssetsCurrent")
             cl = _senaste_varde(gaap, "LiabilitiesCurrent")
             resultat["current_ratio"] = round(ca / cl, 2) if ca and cl else "N/A"
+        except Exception as e:
+            print(f"  [sec_edgar] current_ratio-beräkning misslyckades: {e}")
+            resultat["current_ratio"] = "N/A"
 
-        # --- EARNINGS RANK ---
+    # --- EARNINGS RANK ---
+    try:
         eps_serie_for_rank, eps_tagg = _valj_basta_tagg_serie(gaap, EPS_TAGGAR, "USD/shares", "earnings_rank")
         if eps_serie_for_rank and eps_tagg:
             senaste_datum = max(eps_serie_for_rank.keys())
@@ -471,7 +633,7 @@ def sec_edgar_data_och_ranks(ticker, cik_str, falt_saknas):
             if period:
                 ar, q = period
                 nu_dict = hamta_frame_cachad(eps_tagg, f"CY{ar}Q{q}", "USD-per-shares")
-                da_dict = hamta_frame_cachad(eps_tagg, f"CY{ar-1}Q{q}", "USD-per-shares")
+                da_dict = hamta_frame_cachad(eps_tagg, f"CY{ar - 1}Q{q}", "USD-per-shares")
                 universum = []
                 for c, v_nu in nu_dict.items():
                     if c in da_dict:
@@ -481,26 +643,38 @@ def sec_edgar_data_och_ranks(ticker, cik_str, falt_saknas):
                 if target is not None:
                     if target not in universum: universum.append(target)
                     resultat["earnings_rank"] = round(percentileofscore(universum, target, kind="weak"))
+    except Exception as e:
+        print(f"  [sec_edgar] earnings_rank-beräkning misslyckades: {e}")
 
-        # --- SALES RANK ---
+    # --- SALES RANK ---
+    try:
         sales_serie_for_rank, sales_tagg = _valj_basta_tagg_serie(gaap, SALES_TAGGAR, "USD", "sales_rank")
         if sales_serie_for_rank and sales_tagg:
             slutdatum_str = max(sales_serie_for_rank.keys())
             kant_varde = sales_serie_for_rank[slutdatum_str]["val"]
             slutdatum = datetime.strptime(slutdatum_str, "%Y-%m-%d")
-            period = verifiera_kalenderkvartal_generic(cik_str, sales_tagg, slutdatum.year, (slutdatum.month - 1) // 3 + 1, kant_varde, "USD")
+            period = verifiera_kalenderkvartal_generic(
+                cik_str, sales_tagg, slutdatum.year, (slutdatum.month - 1) // 3 + 1, kant_varde, "USD"
+            )
             if period:
                 ar, q = period
                 nu_dict = hamta_frame_cachad(sales_tagg, f"CY{ar}Q{q}", "USD")
-                da_dict = hamta_frame_cachad(sales_tagg, f"CY{ar-1}Q{q}", "USD")
+                da_dict = hamta_frame_cachad(sales_tagg, f"CY{ar - 1}Q{q}", "USD")
                 universum = {c: (nu_dict[c] - da_dict[c]) / abs(da_dict[c]) for c in nu_dict if c in da_dict and da_dict[c] != 0}
                 if cik_str in universum:
                     resultat["sales_rank"] = round(percentileofscore(list(universum.values()), universum[cik_str], kind="weak"))
+    except Exception as e:
+        print(f"  [sec_edgar] sales_rank-beräkning misslyckades: {e}")
 
+    # --- KVARTALSHISTORIK (oberoende av ovanstående) ---
+    try:
         resultat["kvartalshistorik"] = hamta_kvartalshistorik(gaap)
     except Exception as e:
-        print(f"Fel vid SEC-exekvering: {e}")
+        print(f"  [sec_edgar] kvartalshistorik-hämtning misslyckades: {e}")
+        resultat["kvartalshistorik"] = []
+
     return resultat
+
 
 # ============================================================
 # GOOGLE SHEETS
@@ -508,6 +682,7 @@ def sec_edgar_data_och_ranks(ticker, cik_str, falt_saknas):
 def _konvertera(varde):
     if hasattr(varde, "item"): varde = varde.item()
     return varde
+
 
 def _jamfor_varden(original, aterlast):
     if aterlast is None or str(aterlast).strip() == "": return "fel"
@@ -525,53 +700,69 @@ def _jamfor_varden(original, aterlast):
     if diff <= tolerans: return "avrundning"
     return "fel"
 
+
 def skriv_till_sheets(data, kvartalshistorik, surprise_lista, earnings_rorelse_lista):
+    """
+    Tidigare gjordes ett update_acell() + acell()-anrop PER fält (18 fält),
+    plus 6 radskrivningar och 2 rangeskrivningar - 40+ separata API-anrop
+    mot Google Sheets (kvot ~60 req/min/user). Nu batchas alla skrivningar
+    till EN batch_update, och all verifieringsläsning till EN batch_get.
+    """
     scopes = ["https://www.googleapis.com/auth/spreadsheets"]
     creds_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
     creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
     gc = gspread.authorize(creds)
     ws = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB)
 
-    fel = []
-    avrundningsvarningar = []
-
+    batch_requests = []
+    faltordning = []
     for falt, varde in data.items():
         cell = CELL_MAP.get(falt)
         if not cell: continue
         varde = _konvertera(varde)
-        ws.update_acell(cell, varde)
-        lastvarde = ws.acell(cell).value
-        status = _jamfor_varden(varde, lastvarde)
-        if status == "avrundning":
-            avrundningsvarningar.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}' (avrundning)")
-        elif status == "fel":
-            fel.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}'")
+        batch_requests.append({"range": cell, "values": [[varde]]})
+        faltordning.append((falt, cell, varde))
 
     kol_start, kol_slut = KVARTAL_KOLUMNER[0], KVARTAL_KOLUMNER[-1]
-    def skriv_rad(rad_nr, faltnamn):
+
+    def rad_request(rad_nr, faltnamn):
         varden = [_konvertera(kv.get(faltnamn, "N/A")) for kv in kvartalshistorik]
-        ws.update(range_name=f"{kol_start}{rad_nr}:{kol_slut}{rad_nr}", values=[varden])
+        return {"range": f"{kol_start}{rad_nr}:{kol_slut}{rad_nr}", "values": [varden]}
+
+    fel = []
+    avrundningsvarningar = []
 
     if kvartalshistorik:
-        skriv_rad(RAD_REVENUE, "revenue")
-        skriv_rad(RAD_REVENUE_TILLVAXT, "revenue_tillvaxt")
-        skriv_rad(RAD_EPS, "eps")
-        skriv_rad(RAD_EPS_TILLVAXT, "eps_tillvaxt")
-        skriv_rad(RAD_DIL_SHARES, "dil_shares")
-        skriv_rad(RAD_MARGINAL, "marginal")
+        for rad_nr, faltnamn in [
+            (RAD_REVENUE, "revenue"), (RAD_REVENUE_TILLVAXT, "revenue_tillvaxt"),
+            (RAD_EPS, "eps"), (RAD_EPS_TILLVAXT, "eps_tillvaxt"),
+            (RAD_DIL_SHARES, "dil_shares"), (RAD_MARGINAL, "marginal"),
+        ]:
+            batch_requests.append(rad_request(rad_nr, faltnamn))
     else:
         fel.append("kvartalshistorik: ingen data hämtad från SEC EDGAR")
 
     kol4_start, kol4_slut = KVARTAL_KOLUMNER[-4], KVARTAL_KOLUMNER[-1]
-    surprise_pad = surprise_lista[-4:]
-    surprise_pad = ["N/A"] * (4 - len(surprise_pad)) + surprise_pad
-    ws.update(range_name=f"{kol4_start}{RAD_SURPRISE}:{kol4_slut}{RAD_SURPRISE}", values=[surprise_pad])
+    surprise_pad = pad_left(surprise_lista, 4)
+    rorelse_pad = pad_left(earnings_rorelse_lista, 4)
+    batch_requests.append({"range": f"{kol4_start}{RAD_SURPRISE}:{kol4_slut}{RAD_SURPRISE}", "values": [surprise_pad]})
+    batch_requests.append({"range": f"{kol4_start}{RAD_EARNINGS_RORELSE}:{kol4_slut}{RAD_EARNINGS_RORELSE}", "values": [rorelse_pad]})
 
-    rorelse_pad = earnings_rorelse_lista[-4:]
-    rorelse_pad = ["N/A"] * (4 - len(rorelse_pad)) + rorelse_pad
-    ws.update(range_name=f"{kol4_start}{RAD_EARNINGS_RORELSE}:{kol4_slut}{RAD_EARNINGS_RORELSE}", values=[rorelse_pad])
+    ws.batch_update(batch_requests, value_input_option="USER_ENTERED")
+
+    if faltordning:
+        celler = [cell for _, cell, _ in faltordning]
+        lasta = ws.batch_get(celler)
+        for (falt, cell, varde), cellvarden in zip(faltordning, lasta):
+            lastvarde = cellvarden[0][0] if cellvarden and cellvarden[0] else None
+            status = _jamfor_varden(varde, lastvarde)
+            if status == "avrundning":
+                avrundningsvarningar.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}' (avrundning)")
+            elif status == "fel":
+                fel.append(f"{falt} ({cell}): skrev '{varde}', läste tillbaka '{lastvarde}'")
 
     return fel, avrundningsvarningar
+
 
 def main():
     ticker = os.environ.get("TICKER", "").strip().upper()
@@ -580,24 +771,34 @@ def main():
         sys.exit(1)
 
     print(f"Hämtar data för {ticker}...")
-    data = hamta_yfinance_data(ticker)
-    surprise_lista = data.pop("_surprise_lista", [])
-    earnings_rorelse_lista = data.pop("_earnings_rorelse_lista", [])
 
-    cik_str = None
-    tm = {}
-    try:
-        tm = requests.get("https://www.sec.gov/files/company_tickers.json", headers=HEADERS).json()
+    def _hamta_cik():
+        r = hamta_med_retry("https://www.sec.gov/files/company_tickers.json", headers=HEADERS)
+        if r is None:
+            return None
+        try:
+            tm = r.json()
+        except Exception:
+            return None
         for v in tm.values():
             if v["ticker"] == ticker:
-                cik_str = str(v["cik_str"]).zfill(10)
-                break
-    except Exception as e:
-        print(f"Kunde inte ladda ticker-mappning: {e}")
+                return str(v["cik_str"]).zfill(10)
+        return None
 
-    # --- INJEKTERAD RS RATING ---
-    print("Kör parallell mass-inhämtning för RS Rating (tar ~60 sekunder)...")
-    data["rs_rating"] = hamta_rs_rating(ticker, tm) if tm else "N/A"
+    # yfinance-data, RS-rating-lookup (cache) och CIK-lookup är oberoende
+    # nätverksanrop - kör dem parallellt istället för i serie.
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        future_yf = executor.submit(hamta_yfinance_data, ticker)
+        future_rs = executor.submit(hamta_rs_rating_fran_cache, ticker)
+        future_cik = executor.submit(_hamta_cik)
+
+        data = future_yf.result()
+        rs_rating = future_rs.result()
+        cik_str = future_cik.result()
+
+    surprise_lista = data.pop("_surprise_lista", [])
+    earnings_rorelse_lista = data.pop("_earnings_rorelse_lista", [])
+    data["rs_rating"] = rs_rating
 
     kvartalshistorik = []
     if cik_str:
@@ -626,6 +827,7 @@ def main():
         sys.exit(1)
 
     print(f"Klart. {ticker} skrivet till bladet '{SHEET_TAB}'.")
+
 
 if __name__ == "__main__":
     main()
