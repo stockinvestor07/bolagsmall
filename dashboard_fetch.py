@@ -12,12 +12,17 @@ IBD Company Rank, IBD Sector Rank, Trend Stage fylls INTE i (manuellt).
 
 RS RATING: beräknas normalt INTE här. Hela universumet (~3000 bolag)
 räknas om av det separata scriptet rs_rating_update.py, som körs
-schemalagt måndag + torsdag och skriver resultatet till Sheets-fliken
-"RS_Cache". Detta script läser bara upp cachat värde för aktuell ticker -
-MEN om cachen saknas eller är äldre än RS_CACHE_MAX_ALDER_DAGAR (t.ex.
-om det schemalagda jobbet missades) körs rs_rating_update.py som en
-engångs-fallback här innan uppslaget görs, så dashboarden aldrig
-tyst arbetar med kraftigt inaktuell RS-data.
+schemalagt måndag + torsdag och skriver resultatet till JSON-filen
+"data/rs_cache.json" i repot (INTE Google Sheets - RS-cachen är ren
+maskindata och ska inte skräpa ner Sheeten som används för manuell
+uppföljning). Detta script läser bara upp cachat värde för aktuell
+ticker ur den filen.
+
+Om cachen saknas eller är äldre än RS_CACHE_MAX_ALDER_DAGAR (t.ex. om
+det schemalagda mån/tors-jobbet missades) körs rs_rating_update.py:s
+hela beräkning här som en engångs-fallback, DIREKT I MINNET/på disk för
+den här körningen - men committas INTE tillbaka till repot (det gör
+bara det schemalagda jobbet). Se sakerstall_farsk_rs_cache.
 """
 
 import os
@@ -98,7 +103,12 @@ TOM_KVARTAL = {
 
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = "Dashboard"
-RS_CACHE_TAB = "RS_Cache"
+
+# RS-cache ligger som fil i repot, inte i Sheets (se moduldocstring).
+# Samma default-path som i rs_rating_update.py - måste vara identisk
+# eftersom dashboard_fetch.py:s fallback anropar rs_rating_update.main()
+# direkt (samma process, samma cwd = repo-roten i GitHub Actions).
+RS_CACHE_FIL = os.environ.get("RS_CACHE_FIL", "data/rs_cache.json")
 RS_CACHE_MAX_ALDER_DAGAR = 5  # måndag->torsdag = 3 dagar, torsdag->måndag = 4 dagar
 
 
@@ -177,39 +187,40 @@ def verifiera_kalenderkvartal_generic(cik_str, tagg, gissad_ar, gissad_q, eget_v
 
 
 # ============================================================
-# RS RATING - läses från cache (se rs_rating_update.py)
+# RS RATING - läses från JSON-fil i repot (se rs_rating_update.py)
 # ============================================================
-def _oppna_rs_cache_worksheet(readonly=True):
-    scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"] if readonly else [
-        "https://www.googleapis.com/auth/spreadsheets"
-    ]
-    creds_json = json.loads(os.environ["GOOGLE_SERVICE_ACCOUNT_JSON"])
-    creds = Credentials.from_service_account_info(creds_json, scopes=scopes)
-    gc = gspread.authorize(creds)
-    return gc.open_by_key(SHEET_ID).worksheet(RS_CACHE_TAB)
-
-
-def _rs_cache_ar_farsk(max_alder_dagar):
+def _las_rs_cache_fil(filnamn=RS_CACHE_FIL):
     """
-    Kontrollerar om RS_Cache finns och är färsk nog. Returnerar (är_farsk, rows).
-    rows är None om cachen inte kunde läsas alls (nätverksfel etc) - då avstår
-    vi från att gissa och kör ingen fallback-uppdatering.
+    Läser cache-filen. Returnerar (finns, data-dict). data-dict är {} om
+    filen saknas eller inte gick att tolka - skiljs INTE från "finns men
+    tom", eftersom båda fallen ska trigga samma fallback (ombyggnad).
     """
+    if not os.path.exists(filnamn):
+        return False, {}
     try:
-        ws = _oppna_rs_cache_worksheet(readonly=True)
-        rows = ws.get_all_records()
-    except gspread.WorksheetNotFound:
-        return False, []
+        with open(filnamn, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return False, {}
+        return True, data
     except Exception as e:
-        print(f"  [rs_rating] kunde inte kontrollera cache-status: {e}")
-        return True, None  # osäkert läge - anta färsk, försök inte trigga ombyggnad blint
+        print(f"  [rs_rating] kunde inte läsa/tolka '{filnamn}': {e}")
+        return False, {}
 
-    if not rows:
-        return False, []
+
+def _rs_cache_ar_farsk(max_alder_dagar, filnamn=RS_CACHE_FIL):
+    """
+    Kontrollerar om cache-filen finns och är färsk nog utifrån det äldsta
+    Updated_At-värdet i filen (samma "hela universumet uppdaterat samtidigt"-
+    logik som tidigare Sheets-version). Returnerar (är_farsk, data).
+    """
+    finns, data = _las_rs_cache_fil(filnamn)
+    if not finns or not data:
+        return False, {}
 
     aldsta_uppdatering = None
-    for row in rows:
-        uppdaterad = row.get("Updated_At")
+    for post in data.values():
+        uppdaterad = post.get("Updated_At")
         try:
             alder = datetime.now(timezone.utc) - datetime.fromisoformat(uppdaterad)
             if aldsta_uppdatering is None or alder > aldsta_uppdatering:
@@ -218,70 +229,63 @@ def _rs_cache_ar_farsk(max_alder_dagar):
             continue
 
     if aldsta_uppdatering is None:
-        return False, rows  # kunde inte tolka Updated_At överhuvudtaget
-    return aldsta_uppdatering.days <= max_alder_dagar, rows
+        return False, data  # kunde inte tolka Updated_At överhuvudtaget
+    return aldsta_uppdatering.days <= max_alder_dagar, data
 
 
 def sakerstall_farsk_rs_cache(max_alder_dagar=RS_CACHE_MAX_ALDER_DAGAR):
     """
-    Om cachen saknas eller är äldre än max_alder_dagar (t.ex. det schemalagda
-    mån/tors-jobbet missades en vecka) körs rs_rating_update.py:s hela
-    beräkning här som en engångs-fallback, istället för att bara logga en
-    varning och fortsätta med inaktuell data. Normalfallet (cache färsk)
-    kostar bara en läsning.
+    Om cache-filen saknas eller är äldre än max_alder_dagar (t.ex. det
+    schemalagda mån/tors-jobbet missades) körs rs_rating_update.py:s hela
+    beräkning här som en engångs-fallback (committa=False - se plan:
+    alternativ A). Filen på disk uppdateras för DEN HÄR körningen, men
+    committas inte till repot; nästa schemalagda körning gör det permanent.
     """
-    ar_farsk, rows = _rs_cache_ar_farsk(max_alder_dagar)
-    if rows is None:
-        return  # osäkert läge, se _rs_cache_ar_farsk
+    ar_farsk, _ = _rs_cache_ar_farsk(max_alder_dagar)
     if ar_farsk:
         return
 
     print(f"  [rs_rating] cache saknas eller är äldre än {max_alder_dagar} dagar - "
-          f"kör rs_rating_update.py som fallback innan uppslag...")
+          f"kör rs_rating_update.py som fallback (utan commit) innan uppslag...")
     try:
         import rs_rating_update
-        rs_rating_update.main()
+        rs_rating_update.main(committa=False)
     except SystemExit:
         pass  # rs_rating_update.main() kan anropa sys.exit(); låt inte det avbryta dashboard-körningen
     except Exception as e:
         print(f"  [rs_rating] fallback-körning av rs_rating_update.py misslyckades: {e}")
 
 
-def hamta_rs_rating_fran_cache(ticker):
+def hamta_rs_rating_fran_cache(ticker, filnamn=RS_CACHE_FIL):
     """
-    Läser förberäknat RS Rating ur fliken 'RS_Cache'. Den fliken fylls
-    normalt av det separata scriptet rs_rating_update.py, schemalagt
-    måndag + torsdag. Om cachen är för gammal körs den uppdateringen
-    här istället (se sakerstall_farsk_rs_cache), så en enskild
-    dashboard-körning aldrig arbetar med kraftigt inaktuell RS-data -
-    men den normala vägen kräver bara en Sheets-läsning.
+    Läser förberäknat RS Rating ur data/rs_cache.json. Filen fylls normalt
+    av det separata scriptet rs_rating_update.py, schemalagt måndag +
+    torsdag. Om cachen är för gammal körs den uppdateringen här istället
+    (se sakerstall_farsk_rs_cache), så en enskild dashboard-körning aldrig
+    arbetar med kraftigt inaktuell RS-data.
     """
     sakerstall_farsk_rs_cache()
 
+    finns, data = _las_rs_cache_fil(filnamn)
+    if not finns:
+        print(f"  [rs_rating] cache-filen '{filnamn}' finns fortfarande inte - kunde inte läsa RS Rating.")
+        return "N/A"
+
+    post = data.get(ticker.upper())
+    if post is None:
+        print(f"  [rs_rating] {ticker} saknas i cache trots fallback-uppdatering.")
+        return "N/A"
+
+    uppdaterad = post.get("Updated_At")
     try:
-        ws = _oppna_rs_cache_worksheet(readonly=True)
-        rows = ws.get_all_records()
-    except gspread.WorksheetNotFound:
-        print(f"  [rs_rating] fliken '{RS_CACHE_TAB}' finns fortfarande inte - kunde inte läsa RS Rating.")
-        return "N/A"
-    except Exception as e:
-        print(f"  [rs_rating] kunde inte läsa cache: {e}")
-        return "N/A"
+        alder = datetime.now(timezone.utc) - datetime.fromisoformat(uppdaterad)
+        if alder.days > RS_CACHE_MAX_ALDER_DAGAR:
+            print(f"  [rs_rating] VARNING: cache är fortfarande {alder.days} dagar gammal "
+                  f"({uppdaterad}) trots fallback-försök.")
+    except Exception:
+        pass
 
-    for row in rows:
-        if str(row.get("Ticker", "")).upper() == ticker.upper():
-            uppdaterad = row.get("Updated_At")
-            try:
-                alder = datetime.now(timezone.utc) - datetime.fromisoformat(uppdaterad)
-                if alder.days > RS_CACHE_MAX_ALDER_DAGAR:
-                    print(f"  [rs_rating] VARNING: cache är fortfarande {alder.days} dagar gammal "
-                          f"({uppdaterad}) trots fallback-försök.")
-            except Exception:
-                pass
-            return row.get("RS_Rank", "N/A")
-
-    print(f"  [rs_rating] {ticker} saknas i cache trots fallback-uppdatering.")
-    return "N/A"
+    return post.get("RS_Rank", "N/A")
 
 
 # ============================================================
@@ -790,8 +794,8 @@ def main():
                 return str(v["cik_str"]).zfill(10)
         return None
 
-    # yfinance-data, RS-rating-lookup (cache) och CIK-lookup är oberoende
-    # nätverksanrop - kör dem parallellt istället för i serie.
+    # yfinance-data, RS-rating-lookup (fil, ev. fallback-beräkning) och
+    # CIK-lookup är oberoende - kör dem parallellt istället för i serie.
     with ThreadPoolExecutor(max_workers=3) as executor:
         future_yf = executor.submit(hamta_yfinance_data, ticker)
         future_rs = executor.submit(hamta_rs_rating_fran_cache, ticker)
