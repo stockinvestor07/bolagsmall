@@ -49,10 +49,11 @@ REQUEST_TIMEOUT = 15
 # GitHub Actions alltid är repo-roten (actions/checkout@v4 checkar ut dit).
 CACHE_FIL = os.environ.get("RS_CACHE_FIL", "data/rs_cache.json")
 
-BATCH_STORLEK = 500
-MAX_WORKERS = 6
+BATCH_STORLEK = 250
+MAX_WORKERS = 2
 MIN_HANDELSDAGAR = 240
 MIN_LYCKAD_ANDEL_VARNING = 80.0  # varna om färre än X% av universumet gick att beräkna
+BATCH_PAUS_SEK = 3  # paus innan varje batch-nedladdning, för att undvika rate-limiting mot Yahoo
 
 
 def hamta_med_retry(url, headers=None, forsok=3, backoff=2):
@@ -105,9 +106,19 @@ def bygg_universum(sec_tickers_dict, target_ticker=None):
 
 def _bearbeta_rs_batch(batch):
     lokal, misslyckade = [], []
+    # Kort paus innan varje batch-hämtning. Körs inifrån ThreadPoolExecutor,
+    # vilket sprider ut anropen även när flera workers är aktiva samtidigt.
+    time.sleep(BATCH_PAUS_SEK)
     try:
+        # threads=False (tidigare True): med threads=True spawnar yfinance EGNA
+        # interna parallella anrop per ticker INOM batchen, utöver den yttre
+        # ThreadPoolExecutor-parallelliteten här. Med 500 tickers/batch x flera
+        # samtidiga batchar blev den sammanlagda samtidiga belastningen mot
+        # Yahoos API extremt hög, vilket är den sannolika orsaken till att även
+        # extremt likvida tickers (NVDA, AMZN, AVGO) rapporterades som "failed"
+        # (rate-limiting, inte faktisk avlistning).
         raw_data = yf.download(
-            batch, period="1y", auto_adjust=True, group_by="ticker", progress=False, threads=True
+            batch, period="1y", auto_adjust=True, group_by="ticker", progress=False, threads=False
         )
     except Exception as e:
         print(f"  [rs_batch] hela batchen misslyckades ({len(batch)} tickers): {e}")
@@ -219,9 +230,16 @@ def committa_cache_fil(filnamn=CACHE_FIL):
         # för den här körningen även om committen misslyckas.
 
 
-def main(committa=True):
-    """committa=False används av dashboard_fetch.py:s fallback-anrop -
-    då ska bara filen skrivas lokalt, inte committas till repot (se plan: alternativ A)."""
+def main(committa=True, target_ticker=None):
+    """
+    committa=False används av dashboard_fetch.py:s fallback-anrop -
+    då ska bara filen skrivas lokalt, inte committas till repot (se plan: alternativ A).
+
+    target_ticker: säkerställer att just DEN tickern som dashboard_fetch.py
+    väntar på finns med i universumet, oavsett om den ligger inom de första
+    3000 (se bygg_universum). Utan denna kunde t.ex. DELL falla utanför
+    urvalet och fallback-körningen ändå inte ge ett svar för DELL.
+    """
     print("Hämtar ticker->CIK-mappning...")
     r = hamta_med_retry("https://www.sec.gov/files/company_tickers.json", headers=HEADERS)
     if r is None:
@@ -229,8 +247,8 @@ def main(committa=True):
         sys.exit(1)
     tm = r.json()
 
-    print("Beräknar RS Rating för hela universumet (tar ~60 sekunder eller mer)...")
-    df = berakna_rs_universum(tm)
+    print("Beräknar RS Rating för hela universumet (tar ett par minuter)...")
+    df = berakna_rs_universum(tm, target_ticker=normalisera_ticker_for_yf(target_ticker) if target_ticker else None)
     if df.empty:
         print("Ingen RS-data kunde beräknas. Avbryter utan att skriva till cache.")
         sys.exit(1)
@@ -247,4 +265,4 @@ def main(committa=True):
 
 
 if __name__ == "__main__":
-    main(committa=True)
+    main(committa=True, target_ticker=None)
