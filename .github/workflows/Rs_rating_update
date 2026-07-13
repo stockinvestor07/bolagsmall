@@ -5,6 +5,10 @@ on:
     # så justera timmen om du vill träffa en specifik lokal tid.
     - cron: "0 11 * * 1,4"
   workflow_dispatch: {}
+
+permissions:
+  contents: write  # krävs för att scriptet ska kunna committa data/rs_cache.json tillbaka till repot
+
 jobs:
   update:
     runs-on: ubuntu-latest
@@ -15,10 +19,8 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install dependencies
-        run: pip install yfinance gspread google-auth requests scipy pandas lxml
+        run: pip install yfinance requests scipy pandas lxml
       - name: Run RS rating update
         env:
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
           SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
         run: python rs_rating_update.py
