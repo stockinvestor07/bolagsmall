@@ -233,13 +233,18 @@ def _rs_cache_ar_farsk(max_alder_dagar, filnamn=RS_CACHE_FIL):
     return aldsta_uppdatering.days <= max_alder_dagar, data
 
 
-def sakerstall_farsk_rs_cache(max_alder_dagar=RS_CACHE_MAX_ALDER_DAGAR):
+def sakerstall_farsk_rs_cache(ticker, max_alder_dagar=RS_CACHE_MAX_ALDER_DAGAR):
     """
     Om cache-filen saknas eller är äldre än max_alder_dagar (t.ex. det
     schemalagda mån/tors-jobbet missades) körs rs_rating_update.py:s hela
     beräkning här som en engångs-fallback (committa=False - se plan:
     alternativ A). Filen på disk uppdateras för DEN HÄR körningen, men
     committas inte till repot; nästa schemalagda körning gör det permanent.
+
+    ticker skickas som target_ticker till rs_rating_update.main() så att
+    just den efterfrågade aktien garanterat finns med i universumet
+    (annars kan den falla utanför de första 3000 och ändå saknas i
+    resultatet trots en "lyckad" fallback-körning).
     """
     ar_farsk, _ = _rs_cache_ar_farsk(max_alder_dagar)
     if ar_farsk:
@@ -249,7 +254,7 @@ def sakerstall_farsk_rs_cache(max_alder_dagar=RS_CACHE_MAX_ALDER_DAGAR):
           f"kör rs_rating_update.py som fallback (utan commit) innan uppslag...")
     try:
         import rs_rating_update
-        rs_rating_update.main(committa=False)
+        rs_rating_update.main(committa=False, target_ticker=ticker)
     except SystemExit:
         pass  # rs_rating_update.main() kan anropa sys.exit(); låt inte det avbryta dashboard-körningen
     except Exception as e:
@@ -264,7 +269,7 @@ def hamta_rs_rating_fran_cache(ticker, filnamn=RS_CACHE_FIL):
     (se sakerstall_farsk_rs_cache), så en enskild dashboard-körning aldrig
     arbetar med kraftigt inaktuell RS-data.
     """
-    sakerstall_farsk_rs_cache()
+    sakerstall_farsk_rs_cache(ticker)
 
     finns, data = _las_rs_cache_fil(filnamn)
     if not finns:
