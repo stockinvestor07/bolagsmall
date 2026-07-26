@@ -1,0 +1,36 @@
+name: Marknadsbredd (S&P 500)
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  marknadsbredd:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checka ut repo
+        uses: actions/checkout@v4
+
+      - name: Sätt upp Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installera beroenden
+        run: |
+          pip install --upgrade pip
+          pip install yfinance pandas gspread google-auth requests lxml
+
+      - name: Kör marknadsbredd.py
+        env:
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SEC_USER_AGENT: ${{ secrets.SEC_USER_AGENT }}
+        run: python marknadsbredd.py
+
+      - name: Committa uppdaterad tickercache (om ändrad)
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git add data/sp500_tickers.json
+          git diff --staged --quiet || git commit -m "Uppdatera S&P 500-tickercache"
+          git push
