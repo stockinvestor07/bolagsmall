@@ -1,20 +1,25 @@
 """
 marknadsbredd.py
-Beräknar marknadsbredd: andel S&P 500-bolag som handlas över 50MA
-respektive 200MA. Skriver resultatet till Marknadsdashboard-fliken.
+Beräknar marknadsbredd: andel S&P 1500-bolag (S&P 500 + MidCap 400 +
+SmallCap 600) som handlas över 50MA respektive 200MA. Skriver resultatet
+till Marknadsdashboard-fliken.
+
+S&P 1500 valdes istället för S&P 500 eller NYSE Composite:
+- S&P 500 ensamt är för smalt (megacap-tungt, kan dölja svaghet i bredden)
+- NYSE Composite innehåller tusentals icke-aktie-noteringar (preferensaktier,
+  bond-CEFs, REITs, SPAC-skal) som gör breddata strukturellt missvisande
+- S&P 1500 (large+mid+small cap, ren common-stock-korg, ~87% av US
+  market cap) ger en bredare, renare bredd-signal utan kompositionsbruset
 
 Körs manuellt via GitHub Actions (workflow_dispatch), oberoende av
 dashboard_fetch.py (som är per-ticker och skriver till en annan flik,
-"Dashboard"). Marknadsbredd är marknadsbred data och hör hemma i ett
-eget script/workflow, precis som rs_rating_update.py hanterar sitt
-eget universum separat från dashboard_fetch.py.
+"Dashboard").
 
-Tickerlistan (S&P 500) hämtas från Wikipedia och cachas i
-data/sp500_tickers.json. Cachen återanvänds om den är färsk nog
-(se SP500_CACHE_MAX_ALDER_DAGAR), annars hämtas listan om.
+Tickerlistan hämtas FÄRSK från Wikipedia vid varje körning (ingen cache -
+tre snabba sidhämtningar, försumbar kostnad jämfört med kursdata-hämtningen).
 
 Kursdata hämtas i EN batch via yf.download() istället för en loop med
-ett anrop per ticker (~500 separata anrop), för att minimera antal
+ett anrop per ticker (~1500 separata anrop), för att minimera antal
 requests och risken för rate-limiting.
 """
 
@@ -22,7 +27,6 @@ import os
 import sys
 import json
 import io
-from datetime import datetime, timezone
 
 import requests
 import pandas as pd
@@ -34,9 +38,11 @@ USER_AGENT = os.environ.get("SEC_USER_AGENT", "Anton Werner anton.js.werner@gmai
 HEADERS = {"User-Agent": USER_AGENT}
 REQUEST_TIMEOUT = 15
 
-WIKIPEDIA_URL = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
-SP500_CACHE_FIL = os.environ.get("SP500_CACHE_FIL", "data/sp500_tickers.json")
-SP500_CACHE_MAX_ALDER_DAGAR = 7
+WIKIPEDIA_SIDOR = {
+    "S&P 500": "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+    "S&P MidCap 400": "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies",
+    "S&P SmallCap 600": "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies",
+}
 
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = "Marknadsdashboard"
@@ -49,74 +55,39 @@ HISTORIK_PERIOD = "1y"  # räcker gott för 200MA (~252 handelsdagar)
 
 
 # ============================================================
-# TICKERLISTA (S&P 500, cachad)
+# TICKERLISTA (S&P 1500, hämtas färsk varje körning)
 # ============================================================
-def _las_ticker_cache(filnamn=SP500_CACHE_FIL):
-    if not os.path.exists(filnamn):
-        return None
-    try:
-        with open(filnamn, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        uppdaterad = datetime.fromisoformat(data["Updated_At"])
-        alder = datetime.now(timezone.utc) - uppdaterad
-        if alder.days > SP500_CACHE_MAX_ALDER_DAGAR:
-            return None
-        tickers = data.get("tickers", [])
-        return tickers if tickers else None
-    except Exception as e:
-        print(f"  [sp500_cache] kunde inte läsa '{filnamn}': {e}")
-        return None
+def _stada_ticker(symbol):
+    # Yahoo Finance använder "-" istället för "." (t.ex. BRK.B -> BRK-B)
+    return str(symbol).strip().replace(".", "-")
 
 
-def _skriv_ticker_cache(tickers, filnamn=SP500_CACHE_FIL):
-    try:
-        os.makedirs(os.path.dirname(filnamn), exist_ok=True)
-        with open(filnamn, "w", encoding="utf-8") as f:
-            json.dump(
-                {"Updated_At": datetime.now(timezone.utc).isoformat(), "tickers": tickers},
-                f, indent=2,
-            )
-    except Exception as e:
-        print(f"  [sp500_cache] kunde inte skriva '{filnamn}': {e}")
-
-
-def hamta_sp500_tickers():
-    cachad = _las_ticker_cache()
-    if cachad:
-        print(f"  [sp500] Använder cachad lista ({len(cachad)} tickers, "
-              f"< {SP500_CACHE_MAX_ALDER_DAGAR} dagar gammal).")
-        return cachad
-
-    print("  [sp500] Cache saknas/inaktuell - hämtar aktuell lista från Wikipedia...")
-    try:
-        r = requests.get(WIKIPEDIA_URL, headers=HEADERS, timeout=REQUEST_TIMEOUT)
-        r.raise_for_status()
-        tabeller = pd.read_html(io.StringIO(r.text))
-        symboler = tabeller[0]["Symbol"].tolist()
-        # Yahoo Finance använder "-" istället för "." i vissa tickers (t.ex. BRK.B -> BRK-B)
-        tickers = [str(s).strip().replace(".", "-") for s in symboler]
-    except Exception as e:
-        print(f"  [sp500] Wikipedia-hämtning misslyckades: {e}")
-        aldre_cache = _las_ticker_cache_ignorera_alder()
-        if aldre_cache:
-            print(f"  [sp500] Faller tillbaka på gammal cache ({len(aldre_cache)} tickers).")
-            return aldre_cache
-        raise
-
-    _skriv_ticker_cache(tickers)
-    print(f"  [sp500] Hämtade {len(tickers)} tickers, cachade i '{SP500_CACHE_FIL}'.")
+def _hamta_tabell(url, namn):
+    r = requests.get(url, headers=HEADERS, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+    tabeller = pd.read_html(io.StringIO(r.text))
+    df = tabeller[0]
+    kolumn = "Symbol" if "Symbol" in df.columns else "Ticker symbol"
+    tickers = [_stada_ticker(s) for s in df[kolumn].tolist()]
+    print(f"  [sp1500] {namn}: {len(tickers)} tickers hämtade från Wikipedia.")
     return tickers
 
 
-def _las_ticker_cache_ignorera_alder(filnamn=SP500_CACHE_FIL):
-    if not os.path.exists(filnamn):
-        return None
-    try:
-        with open(filnamn, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return data.get("tickers") or None
-    except Exception:
-        return None
+def hamta_sp1500_tickers():
+    print("  [sp1500] Hämtar S&P 500 + MidCap 400 + SmallCap 600 från Wikipedia...")
+    alla = []
+    for namn, url in WIKIPEDIA_SIDOR.items():
+        try:
+            alla.extend(_hamta_tabell(url, namn))
+        except Exception as e:
+            print(f"  [sp1500] VARNING: kunde inte hämta '{namn}': {e}")
+
+    unika = sorted(set(alla))
+    if not unika:
+        raise RuntimeError("Kunde inte hämta någon S&P 1500-ticker från Wikipedia - avbryter.")
+
+    print(f"  [sp1500] Totalt {len(unika)} unika tickers (S&P 1500).")
+    return unika
 
 
 # ============================================================
@@ -183,7 +154,7 @@ def berakna_marknadsbredd(tickers):
     pct_200ma = round(over_200ma / giltiga * 100, 1)
     pct_50ma = round(over_50ma / giltiga * 100, 1)
 
-    print(f"  [resultat] {giltiga} giltiga tickers. "
+    print(f"  [resultat] {giltiga} giltiga tickers (S&P 1500). "
           f"Över 200MA: {over_200ma} ({pct_200ma}%). Över 50MA: {over_50ma} ({pct_50ma}%).")
 
     return pct_200ma, pct_50ma, giltiga, len(misslyckade)
@@ -211,8 +182,8 @@ def skriv_till_sheets(pct_200ma, pct_50ma):
 
 
 def main():
-    print("Beräknar marknadsbredd (S&P 500)...")
-    tickers = hamta_sp500_tickers()
+    print("Beräknar marknadsbredd (S&P 1500)...")
+    tickers = hamta_sp1500_tickers()
     pct_200ma, pct_50ma, giltiga, antal_misslyckade = berakna_marknadsbredd(tickers)
 
     print(f"Skriver till Google Sheets ({SHEET_TAB} -> {CELL_200MA}, {CELL_50MA})...")
