@@ -1,0 +1,32 @@
+name: Weekly News Report
+
+on:
+  schedule:
+    # 17:00 UTC söndag ≈ 18:00 svensk vintertid (CET) / 19:00 sommartid (CEST).
+    # Justera timmen om exakt 18:00 svensk tid krävs året runt (GitHub Actions
+    # cron stödjer inte tidszoner direkt).
+    - cron: "0 17 * * 0"
+  workflow_dispatch: {}  # tillåter manuell testkörning från Actions-fliken
+
+jobs:
+  weekly-news:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installera beroenden
+        run: pip install -r requirements-weekly-news.txt
+
+      - name: Kör veckorapport
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          PORTFOLIO_SHEET_ID: ${{ secrets.PORTFOLIO_SHEET_ID }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python weekly_news_report.py
