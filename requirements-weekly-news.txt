@@ -2,3 +2,4 @@ gspread
 google-auth
 yfinance
 requests
+reportlab
