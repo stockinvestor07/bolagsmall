@@ -46,8 +46,8 @@ WIKIPEDIA_SIDOR = {
 
 SHEET_ID = os.environ["SHEET_ID"]
 SHEET_TAB = "Marknadsdashboard"
-CELL_200MA = "C8"
-CELL_50MA = "C9"
+CELL_200MA = "O4"
+CELL_50MA = "O5"
 
 MA_KORT = 50
 MA_LANG = 200
