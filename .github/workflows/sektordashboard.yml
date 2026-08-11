@@ -1,0 +1,35 @@
+name: Uppdatera Sektordashboard
+
+on:
+  workflow_dispatch:  # manuell trigger - kör via "Run workflow" i GitHub Actions-fliken
+
+jobs:
+  update-sektordashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checka ut repo
+        uses: actions/checkout@v4
+
+      - name: Sätt upp Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installera beroenden
+        run: |
+          python -m pip install --upgrade pip
+          # Antar att requirements.txt redan finns i repot (används av dashboard_fetch.py):
+          # yfinance, pandas, gspread, google-auth, scipy, requests
+          if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+          else
+            pip install yfinance pandas gspread google-auth scipy requests
+          fi
+
+      - name: Kör sektordashboard.py
+        env:
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+        run: python sektordashboard.py
