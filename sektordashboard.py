@@ -54,7 +54,8 @@ SKRIV_KOLUMNER_1 = "C"   # start på C:M-blocket (hoppar över N)
 SKRIV_KOLUMNER_1_SLUT = "M"
 SKRIV_KOLUMN_FLOAT = "O"
 
-PAUS_MELLAN_TICKERS_SEK = 1.0  # schysst mot SEC EDGAR:s fair-use-policy
+PAUS_MELLAN_TICKERS_SEK = 4.0  # höjt från 1.0 - 1 sek räckte inte för att undvika
+                                # Yahoo Finance-blockering vid flera tickers i rad
 
 
 def _hamta_cik(ticker):
